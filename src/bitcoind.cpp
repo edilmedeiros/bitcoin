@@ -269,7 +269,7 @@ MAIN_FUNCTION
     ArgsManager& args = *Assert(node.args);
     if (!ParseArgs(args, argc, argv)) return EXIT_FAILURE;
     // Process early info return commands such as -help or -version
-    if (ProcessInitCommands(args)) return EXIT_SUCCESS;
+    if (ProcessInitCommands(args)) return EXIT_FAILURE;
 
     // Start application
     if (AppInit(node)) {
