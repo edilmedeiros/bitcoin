@@ -7,6 +7,8 @@
 /*build*
 !/build-aux
 !/build_msvc
+.cache
+compile_commands.json
 
 *.pyc
 
@@ -27,3 +29,10 @@ target/
 /guix-build-*
 
 /ci/scratch/
+
+# darwin trash
+.DS_Store
+
+# nix stuff
+.direnv
+.envrc
