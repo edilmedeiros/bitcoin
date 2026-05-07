@@ -33,6 +33,7 @@
 #include <node/utxo_snapshot.h>
 #include <node/warnings.h>
 #include <primitives/transaction.h>
+#include <random.h>
 #include <rpc/server.h>
 #include <rpc/server_util.h>
 #include <rpc/util.h>
@@ -57,10 +58,13 @@
 #include <cstdint>
 
 #include <condition_variable>
+#include <deque>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -3068,6 +3072,25 @@ public:
 };
 
 /**
+ * RAII class that creates a temporary database directory in its constructor
+ * and removes it in its destructor.
+ */
+class TemporaryUTXODatabase
+{
+    fs::path m_path;
+public:
+    TemporaryUTXODatabase(const fs::path& path) : m_path(path) {
+        fs::create_directories(m_path);
+    }
+    ~TemporaryUTXODatabase() {
+        if (!DestroyDB(fs::PathToString(m_path))) {
+            LogInfo("Failed to clean up temporary UTXO database at %s, please remove it manually.",
+                    fs::PathToString(m_path));
+        }
+    }
+};
+
+/**
  * Serialize the UTXO set to a file for loading elsewhere.
  *
  * @see SnapshotMetadata
@@ -3191,24 +3214,503 @@ static RPCMethod dumptxoutset()
     };
 }
 
-/**
- * RAII class that creates a temporary database directory in its constructor
- * and removes it in its destructor.
+namespace {
+
+// ===========================================================================
+// Shared definitions (used by both the decoder and the encoder/dumper)
+// ===========================================================================
+
+/** Total number of contexts the encoding uses. */
+constexpr int SWIFTHINTS_NUM_CONTEXTS = 144;
+
+/** Compute which context (0..143) to use for a specific output.
+ *
+ * n:     total number of outputs in transaction.
+ * i:     position of the current output.
+ * spent: number of spent outputs among the i first outputs in this transaction.
+ *
+ * See the file format comment below for the meaning of the size/position/spent classes.
+ * The per-class offsets are tetrahedral numbers (size) and triangular numbers (position);
+ * the result is always in [0, 143] (the p<7 branch reaches at most 111, the p==7 branch
+ * covers 112..143).
  */
-class TemporaryUTXODatabase
-{
-    fs::path m_path;
-public:
-    TemporaryUTXODatabase(const fs::path& path) : m_path(path) {
-        fs::create_directories(m_path);
-    }
-    ~TemporaryUTXODatabase() {
-        if (!DestroyDB(fs::PathToString(m_path))) {
-            LogInfo("Failed to clean up temporary UTXO database at %s, please remove it manually.",
-                    fs::PathToString(m_path));
+int SwiftHintsContext(int n, int i, int spent) noexcept {
+    int s = std::min(n, 8) - 1;
+    int p = std::min(i, 7);
+    if (p < 7) return s * (s + 1) * (s + 2) / 6 + p * (p + 1) / 2 + spent;
+    return 112 + std::min(spent * 32 / i, 31);
+}
+
+/** Writes the human-readable record format: one line per block, of the form
+ *  "<height> <block_hash>: <tx> <tx> ...", where each <tx> is a string of 'U' (unspent) and
+ *  's' (spent), one character per output. Outputs are fed in one at a time via Output(); a new
+ *  transaction is detected by out_idx returning to 0. (Transactions with zero outputs, which
+ *  consensus forbids, would not appear.) */
+struct SwiftHintsRecordWriter {
+    AutoFile& m_file;
+    int m_cur_height = -1;
+    std::string m_cur_tx = {};
+    bool m_first_tx = true;
+    std::string m_line = {};
+    void Output(int height, const uint256& bh, int /*tx_idx*/, int out_idx, int /*n*/, bool is_unspent, int /*ctx*/) {
+        if (height != m_cur_height) {
+            FlushLine();
+            m_cur_height = height;
+            m_first_tx = true;
+            m_line = strprintf("%d %s:", height, bh.GetHex());
         }
+        if (out_idx == 0) {
+            if (!m_first_tx) FlushTx();
+            m_first_tx = false;
+            m_cur_tx.clear();
+        }
+        m_cur_tx += is_unspent ? 'U' : 's';
+    }
+    void FlushTx() { m_line += ' '; m_line += m_cur_tx; m_cur_tx.clear(); }
+    void FlushLine() {
+        if (m_cur_height < 0) return;
+        FlushTx();
+        m_line += '\n';
+        m_file.write(MakeByteSpan(m_line));
+    }
+    void Finish() { FlushLine(); }
+};
+
+// ===========================================================================
+// Decoder
+// ===========================================================================
+
+struct ANSDecoder {
+    /** Payload to decode (3-byte initial state followed by the bitstream). Non-owning; the caller
+     *  keeps the underlying bytes alive for the decoder's lifetime. */
+    std::span<const uint8_t> m_data;
+    /** How many bytes of m_data have been consumed so far. */
+    size_t m_pos;
+    /** State value, between 0x10000 and 0xffffff inclusive. */
+    uint32_t m_state;
+
+    explicit ANSDecoder(std::span<const uint8_t> data)
+        : m_data{data},
+          m_pos{3},
+          m_state{(uint32_t)data[0] | ((uint32_t)data[1] << 8) | ((uint32_t)data[2] << 16)} {}
+
+    /** Decode a boolean symbol, with probability qprob/256. */
+    bool Get(uint8_t qprob) {
+        if (qprob == 0) return false;
+        uint32_t slot = m_state & 255;
+        bool is_unspent = slot >= (256u - qprob);
+        uint32_t freq = is_unspent ? (uint32_t)qprob : (256u - qprob);
+        uint32_t start = is_unspent ? (256u - qprob) : 0u;
+        m_state = freq * (m_state >> 8) + slot - start;
+        while (m_state < 0x10000) {
+            m_state = (m_state << 8) | m_data[m_pos++];
+        }
+        return is_unspent;
     }
 };
+
+/** Decodes the records of one group. Constructed from the group's bytes with the 4-byte
+ *  size/block-count header already stripped, i.e. the NUM_CONTEXTS quantized probabilities followed
+ *  by the ANS state and bitstream. Non-owning: the caller keeps those bytes alive while decoding. */
+class SwiftHintDecoder {
+    std::span<const uint8_t> m_qprob;
+    ANSDecoder m_ans;
+
+public:
+    explicit SwiftHintDecoder(std::span<const uint8_t> data)
+        : m_qprob{data.first(SWIFTHINTS_NUM_CONTEXTS)},
+          m_ans{data.subspan(SWIFTHINTS_NUM_CONTEXTS)} {}
+
+    /** Decode one transaction's outputs, returning their unspent-ness flags. */
+    std::vector<bool> DecodeTx(unsigned num_outputs) {
+        std::vector<bool> out(num_outputs);
+        int spent_before = 0;
+        for (int i = 0; i < (int)num_outputs; i++) {
+            int ctx = SwiftHintsContext(num_outputs, i, spent_before);
+            bool u = m_ans.Get(m_qprob[ctx]);
+            out[i] = u;
+            if (!u) spent_before++;
+        }
+        return out;
+    }
+
+    /** The ANS state after the symbols decoded so far; must be 0x10000 once a whole group has been
+     *  decoded (per-group checksum). */
+    uint32_t State() const { return m_ans.m_state; }
+};
+
+/** Implementation of the "decode" subcommand: turn a binary swifthints file back into a record
+ *  file. This does not rewind the chain; it walks blocks genesis..target_index and reads the
+ *  unspent-ness of each output from the decoded bitstream. */
+UniValue SwiftHintsDecode(NodeContext& node, const CBlockIndex* target_index, const fs::path& file1, const fs::path& file2)
+{
+    if (!fs::exists(file1)) throw JSONRPCError(RPC_INVALID_PARAMETER, file1.utf8string() + " not found.");
+    if (fs::exists(file2)) throw JSONRPCError(RPC_INVALID_PARAMETER, file2.utf8string() + " already exists.");
+
+    AutoFile fin{fsbridge::fopen(file1, "rb")};
+    if (fin.IsNull()) throw JSONRPCError(RPC_INVALID_PARAMETER, "Cannot open " + file1.utf8string());
+    AutoFile fout{fsbridge::fopen(file2, "w")};
+    if (fout.IsNull()) throw JSONRPCError(RPC_INVALID_PARAMETER, "Cannot open " + file2.utf8string());
+
+    SwiftHintsRecordWriter writer{fout};
+    size_t nout = 0, nbytes = 0;
+    int ngroups = 0, blocks_left = 0;
+    std::vector<uint8_t> group_data;       // owns the current group's bytes; decoder views into it
+    std::optional<SwiftHintDecoder> decoder;
+    int gstart = 0, group_mode = 0;
+    size_t group_txs = 0, group_outputs = 0, group_unspent = 0, group_bytes = 0;
+
+    // Read the next group from the input file and set up its decoder. A clean end-of-file before a
+    // group header signals there are no more groups (returns false); a file that ends partway
+    // through a group is a corrupt input and throws. The decoder always sees the same layout
+    // ([NUM_CONTEXTS probs][3-byte state][bitstream]); for a compact group the single stored
+    // probability is replicated across all contexts.
+    auto next_group = [&]() -> bool {
+        // The high bit of the first byte selects the group mode; read it on its own so a clean EOF
+        // here (no more groups) is distinguishable from a truncated header (corruption, throws below).
+        uint8_t b0;
+        try {
+            fin >> b0;
+        } catch (const std::ios_base::failure&) {
+            return false;
+        }
+        decoder.reset(); // release the previous decoder's view before reusing the buffer
+        uint16_t bitstream_size;
+        int nblk_m1, header_bytes;
+        group_mode = (b0 & 0x80) ? 1 : 0;
+        if (group_mode == 1) {
+            // Compact: blocks-1 in the low 7 bits, then size, then one shared probability byte.
+            uint8_t single_qprob;
+            fin >> bitstream_size >> single_qprob;
+            nblk_m1 = b0 & 0x7F;
+            group_data.resize(SWIFTHINTS_NUM_CONTEXTS + 3 + bitstream_size);
+            std::fill_n(group_data.begin(), SWIFTHINTS_NUM_CONTEXTS, single_qprob);
+            fin.read(MakeWritableByteSpan(group_data).subspan(SWIFTHINTS_NUM_CONTEXTS));
+            header_bytes = 1 + 2 + 1;
+        } else {
+            // Full: blocks-1 in the remaining 15 bits (big-endian), then size, then 144 probabilities.
+            uint8_t b1;
+            fin >> b1 >> bitstream_size;
+            nblk_m1 = ((int)(b0 & 0x7F) << 8) | b1;
+            group_data.resize(SWIFTHINTS_NUM_CONTEXTS + 3 + bitstream_size);
+            fin.read(MakeWritableByteSpan(group_data));
+            header_bytes = 2 + 2 + SWIFTHINTS_NUM_CONTEXTS;
+        }
+        group_bytes = header_bytes + 3 + bitstream_size;
+        decoder.emplace(std::span<const uint8_t>{group_data});
+        blocks_left = nblk_m1 + 1;
+        nbytes += group_bytes;
+        ngroups++;
+        group_txs = 0; group_outputs = 0; group_unspent = 0;
+        return true;
+    };
+
+    for (int height = 0; height <= target_index->nHeight; height++) {
+        node.rpc_interruption_point();
+        if (blocks_left == 0) {
+            if (!next_group())
+                throw JSONRPCError(RPC_INTERNAL_ERROR, strprintf("Unexpected end of data at height %d", height));
+            gstart = height;
+        }
+        const CBlockIndex* bi{WITH_LOCK(::cs_main, return node.chainman->ActiveChain()[height])};
+        if (!bi) throw JSONRPCError(RPC_INTERNAL_ERROR, strprintf("Block not found at height %d", height));
+        CBlock block;
+        if (!node.chainman->m_blockman.ReadBlock(block, *bi))
+            throw JSONRPCError(RPC_INTERNAL_ERROR, strprintf("Failed to read block at height %d", height));
+
+        for (int tx_idx = 0; tx_idx < (int)block.vtx.size(); tx_idx++) {
+            int n = block.vtx[tx_idx]->vout.size();
+            std::vector<bool> unspent = decoder->DecodeTx(n);
+            for (int i = 0; i < n; i++) {
+                bool u = unspent[i];
+                writer.Output(height, bi->GetBlockHash(), tx_idx, i, n, u, /*ctx=*/0);
+                nout++;
+                group_outputs++;
+                if (u) group_unspent++;
+            }
+            group_txs++;
+        }
+
+        blocks_left--;
+        if (blocks_left == 0) {
+            // The encoder's initial state (0x10000) must be recovered as the decoder's final
+            // state; this acts as a per-group checksum.
+            if (decoder->State() != 0x10000)
+                throw JSONRPCError(RPC_INTERNAL_ERROR,
+                    strprintf("ANS checksum mismatch at height %d (state=0x%x)", height, decoder->State()));
+            double bits_per_output = group_outputs > 0 ? (group_bytes * 8.0 / group_outputs) : 0.0;
+            double outs_per_tx = group_txs > 0 ? ((double)group_outputs / group_txs) : 0.0;
+            double upct = group_outputs > 0 ? (100.0 * group_unspent / group_outputs) : 0.0;
+            LogInfo("swifthints decode: group %d (%s), blocks %d-%d, %zu txs, %zu outputs (%.2f/tx, %.2f%% unspent), %zu bytes, %.4f bits/output",
+                    ngroups - 1, group_mode ? "compact" : "full", gstart, height, group_txs, group_outputs, outs_per_tx, upct, group_bytes, bits_per_output);
+        }
+        if (height % 10000 == 0) LogInfo("swifthints decode: %d blocks", height);
+    }
+
+    writer.Finish();
+    if (fout.fclose() != 0) throw JSONRPCError(RPC_INTERNAL_ERROR, "Error closing output file.");
+
+    UniValue r(UniValue::VOBJ);
+    r.pushKV("blocks", (uint64_t)(target_index->nHeight + 1));
+    r.pushKV("outputs", (uint64_t)nout);
+    r.pushKV("groups", (uint64_t)ngroups);
+    r.pushKV("bytes", (uint64_t)nbytes);
+    return r;
+}
+
+// ===========================================================================
+// Dumper (chain rewind + record writer). The encoder lives in the standalone
+// bitcoin-swifthints tool (src/bitcoin-swifthints.cpp), which needs no chain data.
+// ===========================================================================
+
+/** Iterate every output from genesis up to target_index, in block/transaction/output order.
+ *
+ *  For each output, visitor() is called with its location and unspent-ness (determined from
+ *  utxo_view, which must hold the UTXO set as of target_index). After each block, block_done()
+ *  is called with that block's height. */
+void SwiftHintsIterateOutputs(
+    NodeContext& node, ChainstateManager& chainman, CCoinsViewCache& utxo_view,
+    const CBlockIndex* target_index,
+    const std::function<void(int height, const uint256& block_hash, int tx_idx, int out_idx, int n_outputs, bool is_unspent, int ctx)>& visitor,
+    const std::function<void(int height)>& block_done)
+{
+    for (int height = 0; height <= target_index->nHeight; height++) {
+        node.rpc_interruption_point();
+        const CBlockIndex* block_index{WITH_LOCK(::cs_main, return chainman.ActiveChain()[height])};
+        if (!block_index) throw JSONRPCError(RPC_INTERNAL_ERROR, strprintf("Block index not found at height %d", height));
+        CBlock block;
+        if (!chainman.m_blockman.ReadBlock(block, *block_index))
+            throw JSONRPCError(RPC_INTERNAL_ERROR, strprintf("Failed to read block at height %d", height));
+        // Outputs spent by inputs within this same block count as spent.
+        std::set<COutPoint> spent_in_block;
+        for (const auto& tx : block.vtx)
+            if (!tx->IsCoinBase())
+                for (const auto& txin : tx->vin) spent_in_block.insert(txin.prevout);
+        for (int tx_idx = 0; tx_idx < (int)block.vtx.size(); tx_idx++) {
+            const auto& tx = block.vtx[tx_idx];
+            const Txid& txid = tx->GetHash();
+            int n = tx->vout.size();
+            int spent_before = 0;
+            for (int i = 0; i < n; i++) {
+                int ctx = SwiftHintsContext(n, i, spent_before);
+                bool is_unspent = !spent_in_block.count(COutPoint(txid, i)) && utxo_view.HaveCoin(COutPoint(txid, i));
+                visitor(height, block_index->GetBlockHash(), tx_idx, i, n, is_unspent, ctx);
+                if (!is_unspent) spent_before++;
+            }
+        }
+        block_done(height);
+    }
+}
+
+/** Build a temporary on-disk UTXO database holding the UTXO set as of target_index.
+ *
+ *  This copies the current UTXO set into temp_db_path, then rolls it back by disconnecting
+ *  blocks down to target_index. The main chainstate is left untouched. */
+std::unique_ptr<CCoinsViewDB> SwiftHintsBuildUTXO(
+    NodeContext& node, Chainstate& chainstate,
+    const CBlockIndex* target_index, const fs::path& temp_db_path)
+{
+    DBParams db_params{.path = temp_db_path, .cache_bytes = 0, .memory_only = false,
+                       .wipe_data = true, .obfuscate = false, .options = DBOptions{}};
+    auto temp_db = std::make_unique<CCoinsViewDB>(std::move(db_params), CoinsViewOptions{});
+
+    const CBlockIndex* tip;
+    LogInfo("swifthints: Copying current UTXO set to temporary database.");
+    {
+        CCoinsViewCache temp_cache(temp_db.get());
+        std::unique_ptr<CCoinsViewCursor> cursor;
+        {
+            LOCK(::cs_main);
+            tip = chainstate.m_chain.Tip();
+            chainstate.ForceFlushStateToDisk(false);
+            cursor = chainstate.CoinsDB().Cursor();
+        }
+        temp_cache.SetBestBlock(tip->GetBlockHash());
+        size_t coins_count = 0;
+        while (cursor->Valid()) {
+            node.rpc_interruption_point();
+            COutPoint key;
+            Coin coin;
+            if (cursor->GetKey(key) && cursor->GetValue(coin)) {
+                temp_cache.AddCoin(key, std::move(coin), false);
+                if (++coins_count % 100'000 == 0) temp_cache.Flush();
+            }
+            cursor->Next();
+        }
+        temp_cache.Flush();
+        LogInfo("swifthints: UTXO copy complete: %u coins", coins_count);
+    }
+
+    if (tip->nHeight > target_index->nHeight) {
+        LogInfo("swifthints: Rolling back from %d to %d", tip->nHeight, target_index->nHeight);
+        const CBlockIndex* block_index{tip};
+        CCoinsViewCache rollback_cache(temp_db.get());
+        rollback_cache.SetBestBlock(block_index->GetBlockHash());
+        while (block_index->nHeight > target_index->nHeight) {
+            node.rpc_interruption_point();
+            CBlock block;
+            if (!node.chainman->m_blockman.ReadBlock(block, *block_index))
+                throw JSONRPCError(RPC_INTERNAL_ERROR, strprintf("Failed to read block at height %d", block_index->nHeight));
+            DisconnectResult res;
+            WITH_LOCK(::cs_main, res = chainstate.DisconnectBlock(block, block_index, rollback_cache));
+            if (res == DISCONNECT_FAILED)
+                throw JSONRPCError(RPC_INTERNAL_ERROR, strprintf("Failed to roll back at height %d", block_index->nHeight));
+            if (block_index->nHeight % 1000 == 0) rollback_cache.Flush();
+            block_index = block_index->pprev;
+        }
+        rollback_cache.Flush();
+    }
+    return temp_db;
+}
+
+/** Compute a unique temporary database path inside the data directory. */
+fs::path SwiftHintsTempPath(const ArgsManager& args, const CBlockIndex* target_index)
+{
+    return fsbridge::AbsPathJoin(args.GetDataDirNet(),
+        fs::u8path(strprintf("temp_utxo_swift_%d_%s", target_index->nHeight, GetRandHash().ToString().substr(0, 8))));
+}
+
+/** Acquire a prune lock that keeps the blocks needed for a rollback available.
+ *
+ *  Returns nullptr if the node is not in prune mode. Throws if the required block data has
+ *  already been pruned. */
+std::unique_ptr<TemporaryPruneLock> SwiftHintsMakePruneLock(NodeContext& node)
+{
+    if (!node.chainman->m_blockman.IsPruneMode()) return nullptr;
+    LOCK(node.chainman->GetMutex());
+    const CBlockIndex& first_block{node.chainman->m_blockman.GetFirstBlock(*node.chainman->ActiveChain().Tip(), BLOCK_HAVE_MASK)};
+    if (first_block.nHeight > 0) throw JSONRPCError(RPC_MISC_ERROR, "Block data is pruned.");
+    return std::make_unique<TemporaryPruneLock>(node.chainman->m_blockman, 0);
+}
+
+/** Owns the temporary UTXO set (rolled back to target_index) and everything keeping it alive.
+ *
+ *  Member order matters: the prune lock is taken first, then the temporary directory is created,
+ *  then the database is built and rolled back, and finally a cache view is wrapped around it.
+ *  Everything is torn down (and the temporary directory removed) on destruction. */
+struct SwiftHintsRollback {
+    fs::path m_path;
+    std::unique_ptr<TemporaryPruneLock> m_prune_lock;
+    TemporaryUTXODatabase m_cleaner;
+    std::unique_ptr<CCoinsViewDB> m_db;
+    CCoinsViewCache m_view;
+
+    SwiftHintsRollback(NodeContext& node, Chainstate& chainstate, const CBlockIndex* target_index, const ArgsManager& args)
+        : m_path{SwiftHintsTempPath(args, target_index)},
+          m_prune_lock{SwiftHintsMakePruneLock(node)},
+          m_cleaner{m_path},
+          m_db{SwiftHintsBuildUTXO(node, chainstate, target_index, m_path)},
+          m_view{m_db.get()} {}
+};
+
+/** Implementation of the "dump" subcommand: write a human-readable record file. */
+UniValue SwiftHintsDump(NodeContext& node, const ArgsManager& args, const CBlockIndex* target_index, const fs::path& file1)
+{
+    if (fs::exists(file1)) throw JSONRPCError(RPC_INVALID_PARAMETER, file1.utf8string() + " already exists.");
+
+    SwiftHintsRollback rollback(node, node.chainman->ActiveChainstate(), target_index, args);
+
+    AutoFile afile{fsbridge::fopen(file1, "w")};
+    if (afile.IsNull()) throw JSONRPCError(RPC_INVALID_PARAMETER, "Cannot open " + file1.utf8string());
+    SwiftHintsRecordWriter writer{afile};
+    size_t nout = 0;
+    SwiftHintsIterateOutputs(node, *node.chainman, rollback.m_view, target_index,
+        [&](int h, const uint256& bh, int tx, int out, int n, bool u, int ctx) {
+            writer.Output(h, bh, tx, out, n, u, ctx);
+            nout++;
+        },
+        [&](int h) { if (h % 10000 == 0) LogInfo("swifthints dump: %d blocks", h); });
+    writer.Finish();
+    if (afile.fclose() != 0) throw JSONRPCError(RPC_INTERNAL_ERROR, "Error closing file.");
+
+    UniValue r(UniValue::VOBJ);
+    r.pushKV("blocks", (uint64_t)(target_index->nHeight + 1));
+    r.pushKV("outputs", (uint64_t)nout);
+    return r;
+}
+
+
+} // namespace
+
+/**
+ * SwiftHints file format (.dat)
+ *
+ * The on-disk format -- the concatenation of independently decodable groups, the full/compact group
+ * modes selected by the first byte's high bit, the 144-context model, the quantized probabilities,
+ * and the byte-wise rANS coding -- is documented in full in doc/swifthints.md. The decoder above
+ * (ANSDecoder / SwiftHintDecoder / SwiftHintsDecode) is the reading side of that format; the encoding
+ * side lives in the standalone bitcoin-swifthints tool (src/bitcoin-swifthints.cpp), and a
+ * dependency-free reference decoder lives in contrib/swifthints-decoder.py. All four must stay
+ * byte-compatible; doc/swifthints.md is the normative description.
+ */
+static RPCMethod swifthints()
+{
+    return RPCMethod{
+        "swifthints",
+        "Dump or decode the spent/unspent status of transaction outputs. (Encoding a record file into\n"
+        "the binary format is done by the standalone bitcoin-swifthints tool, which needs no chain data.)\n"
+        "Arguments are named and command-specific; passing them with `bitcoin-cli -named` is recommended.\n"
+        "  dump   (blockhash, record)\n"
+        "      Write a human-readable record file for outputs from genesis to blockhash (requires chain rewind).\n"
+        "  decode (blockhash, swifthints, record)\n"
+        "      Decode a binary swifthints file back into a record file for genesis..blockhash (no rewind).",
+        {
+            {"command", RPCArg::Type::STR, RPCArg::Optional::NO, "One of: dump, decode"},
+            {"blockhash", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED,
+                "The block hash to process up to"},
+            {"record", RPCArg::Type::STR, RPCArg::Optional::OMITTED,
+                "The human-readable record file: output for both dump and decode"},
+            {"swifthints", RPCArg::Type::STR, RPCArg::Optional::OMITTED,
+                "decode only: the binary swifthints file to decode"},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+                {
+                    {RPCResult::Type::NUM, "blocks", "the number of blocks processed"},
+                    {RPCResult::Type::NUM, "outputs", "the number of outputs processed"},
+                    {RPCResult::Type::NUM, "groups", /*optional=*/true, "the number of groups (decode only)"},
+                    {RPCResult::Type::NUM, "bytes", /*optional=*/true, "the encoded size in bytes (decode only)"},
+                }
+        },
+        RPCExamples{
+            HelpExampleCli("-rpcclienttimeout=0 -named swifthints", "command=dump blockhash=\"<hash>\" record=record.txt") +
+            HelpExampleCli("-named swifthints", "command=decode blockhash=\"<hash>\" swifthints=swifthints.dat record=record.txt")
+        },
+        [](const RPCMethod& self, const JSONRPCRequest& request) -> UniValue
+{
+    NodeContext& node = EnsureAnyNodeContext(request.context);
+    const ArgsManager& args{EnsureAnyArgsman(request.context)};
+    const std::string command{self.Arg<std::string_view>("command")};
+
+    // Resolve a named file argument (relative to the data dir), throwing if the command needs it but
+    // it was not supplied.
+    auto req_path = [&](std::string_view key) -> fs::path {
+        auto v = self.MaybeArg<std::string_view>(key);
+        if (!v) throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("'%s' requires the '%s' argument", command, key));
+        return fsbridge::AbsPathJoin(args.GetDataDirNet(), fs::u8path(std::string{*v}));
+    };
+
+    if (command != "dump" && command != "decode")
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "Unknown command '" + command + "'. Use dump or decode.");
+
+    // dump and decode both operate on the active chain up to a target block.
+    const UniValue* blockhash{self.MaybeArg<UniValue>("blockhash")};
+    if (!blockhash) throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("'%s' requires the 'blockhash' argument", command));
+    const uint256 target_hash{ParseHashV(*blockhash, "blockhash")};
+    const CBlockIndex* target_index;
+    {
+        LOCK(::cs_main);
+        target_index = node.chainman->m_blockman.LookupBlockIndex(target_hash);
+        if (!target_index) throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found");
+        if (!node.chainman->ActiveChain().Contains(*target_index))
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "Block is not in the active chain");
+    }
+
+    if (command == "dump") return SwiftHintsDump(node, args, target_index, req_path("record"));
+    return SwiftHintsDecode(node, target_index, req_path("swifthints"), req_path("record")); // command == "decode"
+},
+    };
+}
 
 UniValue CreateRolledBackUTXOSnapshot(
     NodeContext& node,
@@ -3665,6 +4167,7 @@ void RegisterBlockchainRPCCommands(CRPCTable& t)
         {"blockchain", &getdescriptoractivity},
         {"blockchain", &getblockfilter},
         {"blockchain", &dumptxoutset},
+        {"blockchain", &swifthints},
         {"blockchain", &loadtxoutset},
         {"blockchain", &getchainstates},
         {"hidden", &invalidateblock},
