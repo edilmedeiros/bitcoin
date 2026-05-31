@@ -77,18 +77,40 @@ class ANSDecoder:
 
 
 class SwiftHintsDecoder:
-    """Decodes the outputs of a single group. Matches ``class SwiftHintDecoder``.
+    """Decodes the outputs of a single group, including parsing the group's own
+    header. Matches ``class SwiftHintDecoder``.
 
-    ``data`` is the group body with the size/block-count header already stripped:
-    ``NUM_CONTEXTS`` quantized-probability bytes, then the 3-byte ANS state, then
-    the bitstream. A compact group is presented here as a full group whose
-    ``NUM_CONTEXTS`` probability bytes are all identical, so this class does not
-    need to know which mode produced it.
+    Constructed from the whole file buffer ``data`` and the ``offset`` of the
+    group's first byte. It recognizes the full vs compact mode itself (the high bit
+    of that first byte), reads the block count, bitstream size and probability
+    table, and replicates the single shared byte across all contexts for a compact
+    group. After construction, ``nblocks`` is the number of blocks the group covers
+    and ``group_size`` the number of bytes it occupies (so the caller can advance to
+    the next group).
     """
 
-    def __init__(self, data: bytes) -> None:
-        self._qprob: bytes = data[:NUM_CONTEXTS]
-        self._ans: ANSDecoder = ANSDecoder(data[NUM_CONTEXTS:])
+    def __init__(self, data: bytes, offset: int) -> None:
+        if offset + 4 > len(data):
+            raise EOFError("unexpected end of file inside a group header")
+        b0 = data[offset]
+        self.compact: bool = bool(b0 & 0x80)
+        if self.compact:
+            # Compact: 7-bit block count, 2-byte size, one shared probability byte.
+            bitstream_size = data[offset + 1] | (data[offset + 2] << 8)
+            self._qprob: bytes = bytes([data[offset + 3]]) * NUM_CONTEXTS
+            self.nblocks: int = (b0 & 0x7F) + 1
+            body_off = offset + 4
+        else:
+            # Full: 15-bit big-endian block count, 2-byte size, 144 probabilities.
+            bitstream_size = data[offset + 2] | (data[offset + 3] << 8)
+            self._qprob = bytes(data[offset + 4:offset + 4 + NUM_CONTEXTS])
+            self.nblocks = (((b0 & 0x7F) << 8) | data[offset + 1]) + 1
+            body_off = offset + 4 + NUM_CONTEXTS
+        end = body_off + 3 + bitstream_size
+        if end > len(data):
+            raise EOFError("unexpected end of file inside a group")
+        self.group_size: int = end - offset
+        self._ans: ANSDecoder = ANSDecoder(data[body_off:end])
 
     def decode_tx(self, num_outputs: int) -> list[bool]:
         """Decode one transaction's outputs in order, returning one flag per
@@ -116,10 +138,11 @@ class SwiftHintsFileDecoder:
     """Decodes a whole swifthints file, transparently transitioning between
     groups as blocks are consumed.
 
-    Group parsing, the full/compact mode distinction, and per-group checksum
-    verification are all handled internally; individual groups are never exposed.
-    Because groups end on block boundaries and the file stores neither the
-    transaction count per block nor the output count per transaction, the caller
+    Locating each group, advancing from one to the next, and per-group checksum
+    verification are handled here; the per-group header -- including the full/compact
+    mode distinction -- is parsed by :class:`SwiftHintsDecoder`. Individual groups are
+    never exposed. Because groups end on block boundaries and the file stores neither
+    the transaction count per block nor the output count per transaction, the caller
     must mark block boundaries with :meth:`begin_block` (and call
     :meth:`finalize` once at the end); see the module docstring for the loop.
     """
@@ -167,33 +190,10 @@ class SwiftHintsFileDecoder:
             raise ValueError(f"ANS checksum mismatch (state=0x{self._decoder.state:x})")
 
     def _load_group(self) -> None:
-        """Parse the next group header at ``self._pos`` and build its decoder."""
-        data, pos = self._data, self._pos
-        if pos >= len(data):
+        """Build the decoder for the group at ``self._pos`` and advance past it. The
+        group decoder parses the header (mode, block count, probabilities) itself."""
+        if self._pos >= len(self._data):
             raise EOFError("unexpected end of file: expected another group")
-        b0 = data[pos]
-        pos += 1
-        if b0 & 0x80:
-            # Compact group: 7-bit block count, 2-byte size, one shared probability
-            # replicated across all contexts so SwiftHintsDecoder stays uniform.
-            bitstream_size = data[pos] | (data[pos + 1] << 8)
-            pos += 2
-            single_qprob = data[pos]
-            pos += 1
-            nblocks = (b0 & 0x7F) + 1
-            body = bytes([single_qprob]) * NUM_CONTEXTS + data[pos:pos + 3 + bitstream_size]
-            pos += 3 + bitstream_size
-        else:
-            # Full group: 15-bit big-endian block count, 2-byte size, 144 probs.
-            b1 = data[pos]
-            pos += 1
-            bitstream_size = data[pos] | (data[pos + 1] << 8)
-            pos += 2
-            nblocks = (((b0 & 0x7F) << 8) | b1) + 1
-            body = data[pos:pos + NUM_CONTEXTS + 3 + bitstream_size]
-            pos += NUM_CONTEXTS + 3 + bitstream_size
-        if pos > len(data):
-            raise EOFError("unexpected end of file inside a group")
-        self._decoder = SwiftHintsDecoder(body)
-        self._blocks_left = nblocks
-        self._pos = pos
+        self._decoder = SwiftHintsDecoder(self._data, self._pos)
+        self._blocks_left = self._decoder.nblocks
+        self._pos += self._decoder.group_size

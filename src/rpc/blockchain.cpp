@@ -57,6 +57,8 @@
 
 #include <cstdint>
 
+#include <algorithm>
+#include <array>
 #include <condition_variable>
 #include <deque>
 #include <iterator>
@@ -3309,17 +3311,58 @@ struct ANSDecoder {
     }
 };
 
-/** Decodes the records of one group. Constructed from the group's bytes with the 4-byte
- *  size/block-count header already stripped, i.e. the NUM_CONTEXTS quantized probabilities followed
- *  by the ANS state and bitstream. Non-owning: the caller keeps those bytes alive while decoding. */
+/** Decodes the records of one group, parsing the group's own header. Constructed from the group's raw
+ *  bytes starting at the mode/block-count byte: it recognizes the full vs compact mode itself (the high
+ *  bit of that first byte), reads the block count and bitstream size, builds the per-context
+ *  probability table -- replicating the single stored byte across all contexts for a compact group --
+ *  and sets up the ANS decoder over the group's state+bitstream. Non-owning: the caller keeps the bytes
+ *  alive while decoding. */
 class SwiftHintDecoder {
-    std::span<const uint8_t> m_qprob;
+    struct Header {
+        int nblocks;
+        bool compact;
+        std::array<uint8_t, SWIFTHINTS_NUM_CONTEXTS> qprob;
+        std::span<const uint8_t> ans; // [3-byte state][bitstream]
+    };
+    static Header ParseHeader(std::span<const uint8_t> group) {
+        Header h;
+        const uint8_t b0 = group[0];
+        h.compact = (b0 & 0x80) != 0;
+        uint16_t bitstream_size;
+        size_t body_off;
+        if (h.compact) {
+            // Compact: 7-bit block count, 2-byte size, one shared probability replicated everywhere.
+            bitstream_size = (uint16_t)group[1] | ((uint16_t)group[2] << 8);
+            h.qprob.fill(group[3]);
+            h.nblocks = (b0 & 0x7F) + 1;
+            body_off = 1 + 2 + 1;
+        } else {
+            // Full: 15-bit big-endian block count, 2-byte size, 144 per-context probabilities.
+            bitstream_size = (uint16_t)group[2] | ((uint16_t)group[3] << 8);
+            std::copy_n(group.begin() + 4, SWIFTHINTS_NUM_CONTEXTS, h.qprob.begin());
+            h.nblocks = (((int)(b0 & 0x7F) << 8) | group[1]) + 1;
+            body_off = 2 + 2 + SWIFTHINTS_NUM_CONTEXTS;
+        }
+        h.ans = group.subspan(body_off, 3 + bitstream_size);
+        return h;
+    }
+
+    int m_nblocks;
+    bool m_compact;
+    std::array<uint8_t, SWIFTHINTS_NUM_CONTEXTS> m_qprob;
     ANSDecoder m_ans;
 
+    explicit SwiftHintDecoder(const Header& h)
+        : m_nblocks{h.nblocks}, m_compact{h.compact}, m_qprob(h.qprob), m_ans{h.ans} {}
+
 public:
-    explicit SwiftHintDecoder(std::span<const uint8_t> data)
-        : m_qprob{data.first(SWIFTHINTS_NUM_CONTEXTS)},
-          m_ans{data.subspan(SWIFTHINTS_NUM_CONTEXTS)} {}
+    /** Construct from the group's raw bytes (starting at the mode byte); parses the header. */
+    explicit SwiftHintDecoder(std::span<const uint8_t> group) : SwiftHintDecoder(ParseHeader(group)) {}
+
+    /** Number of blocks this group covers. */
+    int BlockCount() const { return m_nblocks; }
+    /** Whether this group used the compact (single shared probability) encoding. */
+    bool Compact() const { return m_compact; }
 
     /** Decode one transaction's outputs, returning their unspent-ness flags. */
     std::vector<bool> DecodeTx(unsigned num_outputs) {
@@ -3355,19 +3398,19 @@ UniValue SwiftHintsDecode(NodeContext& node, const CBlockIndex* target_index, co
     SwiftHintsRecordWriter writer{fout};
     size_t nout = 0, nbytes = 0;
     int ngroups = 0, blocks_left = 0;
-    std::vector<uint8_t> group_data;       // owns the current group's bytes; decoder views into it
+    std::vector<uint8_t> group_data;       // owns the current group's raw bytes; decoder parses & views it
     std::optional<SwiftHintDecoder> decoder;
-    int gstart = 0, group_mode = 0;
+    int gstart = 0;
     size_t group_txs = 0, group_outputs = 0, group_unspent = 0, group_bytes = 0;
 
-    // Read the next group from the input file and set up its decoder. A clean end-of-file before a
-    // group header signals there are no more groups (returns false); a file that ends partway
-    // through a group is a corrupt input and throws. The decoder always sees the same layout
-    // ([NUM_CONTEXTS probs][3-byte state][bitstream]); for a compact group the single stored
-    // probability is replicated across all contexts.
+    // Read the next group's raw bytes from the input file into group_data, verbatim and in on-disk
+    // order, and hand them to a SwiftHintDecoder, which parses the mode, block count and probabilities
+    // itself. A clean end-of-file before a group signals there are no more groups (returns false); a
+    // file that ends partway through a group is corrupt and throws (a read below fails). The reader only
+    // peeks the mode bit and size, to know how many bytes the group occupies on disk.
     auto next_group = [&]() -> bool {
-        // The high bit of the first byte selects the group mode; read it on its own so a clean EOF
-        // here (no more groups) is distinguishable from a truncated header (corruption, throws below).
+        // The first byte holds the mode flag and part of the block count; read it on its own so a clean
+        // EOF here (no more groups) is distinguishable from a truncated group (corruption, throws below).
         uint8_t b0;
         try {
             fin >> b0;
@@ -3375,30 +3418,27 @@ UniValue SwiftHintsDecode(NodeContext& node, const CBlockIndex* target_index, co
             return false;
         }
         decoder.reset(); // release the previous decoder's view before reusing the buffer
+
+        // Every group has a 4-byte fixed prefix (b0 plus three more bytes); their meaning depends on the
+        // mode, but the 2-byte size field and -- for a full group -- the 144 probabilities follow it.
+        uint8_t h1, h2, h3;
+        fin >> h1 >> h2 >> h3;
         uint16_t bitstream_size;
-        int nblk_m1, header_bytes;
-        group_mode = (b0 & 0x80) ? 1 : 0;
-        if (group_mode == 1) {
-            // Compact: blocks-1 in the low 7 bits, then size, then one shared probability byte.
-            uint8_t single_qprob;
-            fin >> bitstream_size >> single_qprob;
-            nblk_m1 = b0 & 0x7F;
-            group_data.resize(SWIFTHINTS_NUM_CONTEXTS + 3 + bitstream_size);
-            std::fill_n(group_data.begin(), SWIFTHINTS_NUM_CONTEXTS, single_qprob);
-            fin.read(MakeWritableByteSpan(group_data).subspan(SWIFTHINTS_NUM_CONTEXTS));
-            header_bytes = 1 + 2 + 1;
-        } else {
-            // Full: blocks-1 in the remaining 15 bits (big-endian), then size, then 144 probabilities.
-            uint8_t b1;
-            fin >> b1 >> bitstream_size;
-            nblk_m1 = ((int)(b0 & 0x7F) << 8) | b1;
-            group_data.resize(SWIFTHINTS_NUM_CONTEXTS + 3 + bitstream_size);
-            fin.read(MakeWritableByteSpan(group_data));
-            header_bytes = 2 + 2 + SWIFTHINTS_NUM_CONTEXTS;
+        size_t prob_bytes;
+        if (b0 & 0x80) { // compact: h1,h2 = size; h3 = the single shared probability
+            bitstream_size = (uint16_t)h1 | ((uint16_t)h2 << 8);
+            prob_bytes = 0;
+        } else {         // full: h1 = high block-count byte; h2,h3 = size; 144 probabilities follow
+            bitstream_size = (uint16_t)h2 | ((uint16_t)h3 << 8);
+            prob_bytes = SWIFTHINTS_NUM_CONTEXTS;
         }
-        group_bytes = header_bytes + 3 + bitstream_size;
+        group_data.resize(4 + prob_bytes + 3 + bitstream_size);
+        group_data[0] = b0; group_data[1] = h1; group_data[2] = h2; group_data[3] = h3;
+        fin.read(MakeWritableByteSpan(group_data).subspan(4)); // probabilities (full only) + state + bitstream
+
         decoder.emplace(std::span<const uint8_t>{group_data});
-        blocks_left = nblk_m1 + 1;
+        blocks_left = decoder->BlockCount();
+        group_bytes = group_data.size();
         nbytes += group_bytes;
         ngroups++;
         group_txs = 0; group_outputs = 0; group_unspent = 0;
@@ -3442,7 +3482,7 @@ UniValue SwiftHintsDecode(NodeContext& node, const CBlockIndex* target_index, co
             double outs_per_tx = group_txs > 0 ? ((double)group_outputs / group_txs) : 0.0;
             double upct = group_outputs > 0 ? (100.0 * group_unspent / group_outputs) : 0.0;
             LogInfo("swifthints decode: group %d (%s), blocks %d-%d, %zu txs, %zu outputs (%.2f/tx, %.2f%% unspent), %zu bytes, %.4f bits/output",
-                    ngroups - 1, group_mode ? "compact" : "full", gstart, height, group_txs, group_outputs, outs_per_tx, upct, group_bytes, bits_per_output);
+                    ngroups - 1, decoder->Compact() ? "compact" : "full", gstart, height, group_txs, group_outputs, outs_per_tx, upct, group_bytes, bits_per_output);
         }
         if (height % 10000 == 0) LogInfo("swifthints decode: %d blocks", height);
     }
