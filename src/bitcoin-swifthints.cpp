@@ -181,35 +181,63 @@ struct SwiftHintsGroupStats {
         for (const auto& s : m_ctx) agg += s;
         return agg;
     }
-    // ceil((cost_units/UNIT + 16) / 8) bytes: bitstream size plus 16 bits for the final ANS state.
-    static uint64_t CostBitsToBytes(uint64_t cost_units) {
-        return (cost_units + 16 * SWIFTHINTS_COST_UNIT + 8 * SWIFTHINTS_COST_UNIT - 1) / (8 * SWIFTHINTS_COST_UNIT);
+    // Round an unrounded size in 1/2^32-bit units up to whole bytes.
+    static uint64_t UnitsToBytes(uint64_t units) {
+        return (units + 8 * SWIFTHINTS_COST_UNIT - 1) / (8 * SWIFTHINTS_COST_UNIT);
     }
-    uint64_t EstimatedBitstreamBytes() const {
+    // Unrounded bitstream cost in 1/2^32-bit units, including the 16 bits for the final ANS state.
+    // Full mode codes each context with its own probability; single (compact) mode shares one.
+    uint64_t BitstreamUnitsFull() const {
         uint64_t cost_units = 0;
         for (int i = 0; i < SWIFTHINTS_NUM_CONTEXTS; i++) cost_units += m_ctx[i].Quantize().m_cost;
-        return CostBitsToBytes(cost_units);
+        return cost_units + 16 * SWIFTHINTS_COST_UNIT;
     }
-    uint64_t EstimatedBitstreamBytesSingle() const { return CostBitsToBytes(Aggregate().Quantize().m_cost); }
+    uint64_t BitstreamUnitsSingle() const { return Aggregate().Quantize().m_cost + 16 * SWIFTHINTS_COST_UNIT; }
+    uint64_t EstimatedBitstreamBytes() const { return UnitsToBytes(BitstreamUnitsFull()); }
     uint64_t EstimatedBytes() const { return EstimatedBitstreamBytes() + 2 + 2 + SWIFTHINTS_NUM_CONTEXTS; }
 };
 
-constexpr uint64_t SWIFTHINTS_SEGMENT_INF = std::numeric_limits<uint64_t>::max();
+// Cost of encoding a segment, compared in two levels. `bytes` is the rounded-up-to-whole-byte total
+// size -- the real on-disk cost, and the primary key. `units` is the unrounded total in 1/2^32-bit
+// units (header bytes plus the bit-precise bitstream cost) and is used only to break ties between
+// options whose rounded sizes are equal. Comparisons are lexicographic: fewer bytes wins, and on a tie
+// the smaller unrounded total wins (so header/table cost still counts, just not the rounding slack).
+struct SwiftHintsCost {
+    uint64_t bytes;
+    uint64_t units;
+    bool operator<(const SwiftHintsCost& o) const { return bytes != o.bytes ? bytes < o.bytes : units < o.units; }
+    bool operator<=(const SwiftHintsCost& o) const { return !(o < *this); }
+    SwiftHintsCost operator+(const SwiftHintsCost& o) const { return {bytes + o.bytes, units + o.units}; }
+    bool IsInf() const { return bytes == std::numeric_limits<uint64_t>::max(); }
+};
+constexpr SwiftHintsCost SWIFTHINTS_COST_INF{std::numeric_limits<uint64_t>::max(), std::numeric_limits<uint64_t>::max()};
 
-// Estimated total encoded bytes for a `nblocks`-block segment, minimized over full and compact modes;
-// SWIFTHINTS_SEGMENT_INF if neither mode can encode it (bitstream over the 16-bit field, or too many
-// blocks). Full mode pays 2+2+144 header bytes, compact mode 1+2+1.
-uint64_t SwiftHintsSegmentBytes(const SwiftHintsGroupStats& seg, size_t nblocks) {
-    uint64_t best = SWIFTHINTS_SEGMENT_INF;
+// The cheaper of full and compact mode for a `nblocks`-block segment, and which mode that is. Each
+// mode's cost is {rounded bytes, unrounded units = header*8 + bitstream-bits-incl-state}; the cheaper
+// is chosen by SwiftHintsCost's lexicographic order, so a tie on rounded size falls back to the
+// bit-precise total and an exact tie keeps full mode. The cost is SWIFTHINTS_COST_INF if neither mode
+// fits (bitstream over the 16-bit field, or too many blocks). Full mode pays 2+2+144 header bytes,
+// compact mode 1+2+1.
+struct SwiftHintsModeCost { SwiftHintsCost cost; bool compact; };
+SwiftHintsModeCost SwiftHintsChooseMode(const SwiftHintsGroupStats& seg, size_t nblocks) {
+    constexpr uint64_t U = SWIFTHINTS_COST_UNIT;
+    SwiftHintsCost full = SWIFTHINTS_COST_INF, compact = SWIFTHINTS_COST_INF;
     if (nblocks <= (size_t)MAX_BLOCKS_PER_GROUP) {
-        uint64_t bs = seg.EstimatedBitstreamBytes();
-        if (bs <= SWIFTHINTS_MAX_BITSTREAM_BYTES) best = std::min(best, bs + 2 + 2 + SWIFTHINTS_NUM_CONTEXTS);
+        constexpr uint64_t H = 2 + 2 + SWIFTHINTS_NUM_CONTEXTS;
+        uint64_t bu = seg.BitstreamUnitsFull();
+        uint64_t bb = SwiftHintsGroupStats::UnitsToBytes(bu);
+        if (bb <= SWIFTHINTS_MAX_BITSTREAM_BYTES) full = {bb + H, H * 8 * U + bu};
     }
     if (nblocks <= MAX_BLOCKS_PER_GROUP_COMPACT) {
-        uint64_t bs = seg.EstimatedBitstreamBytesSingle();
-        if (bs <= SWIFTHINTS_MAX_BITSTREAM_BYTES) best = std::min(best, bs + 1 + 2 + 1);
+        constexpr uint64_t H = 1 + 2 + 1;
+        uint64_t bu = seg.BitstreamUnitsSingle();
+        uint64_t bb = SwiftHintsGroupStats::UnitsToBytes(bu);
+        if (bb <= SWIFTHINTS_MAX_BITSTREAM_BYTES) compact = {bb + H, H * 8 * U + bu};
     }
-    return best;
+    return compact < full ? SwiftHintsModeCost{compact, true} : SwiftHintsModeCost{full, false};
+}
+SwiftHintsCost SwiftHintsSegmentCost(const SwiftHintsGroupStats& seg, size_t nblocks) {
+    return SwiftHintsChooseMode(seg, nblocks).cost;
 }
 
 // One block's buffered records plus its precomputed per-context statistics (and a little bookkeeping
@@ -338,12 +366,10 @@ private:
             group_txs += m_queue[b].m_txs;
         }
 
-        // Pick the cheaper of the two encodings. Compact mode (one shared probability instead of the
-        // 144-byte table) is only available for short groups, and only chosen when it wins; the +4 /
-        // +148 are the respective fixed-header overheads.
-        bool compact = nblocks <= MAX_BLOCKS_PER_GROUP_COMPACT &&
-                       gstats.EstimatedBitstreamBytesSingle() + 4 <
-                           gstats.EstimatedBitstreamBytes() + (2 + 2 + SWIFTHINTS_NUM_CONTEXTS);
+        // Pick the cheaper of the two encodings, using the same cost model and tie-breaking as the
+        // boundary search. Compact mode (one shared probability instead of the 144-byte table) is only
+        // available for short groups, and is chosen only when it is strictly cheaper.
+        bool compact = SwiftHintsChooseMode(gstats, nblocks).compact;
 
         std::array<uint8_t, SWIFTHINTS_NUM_CONTEXTS> qprob;
         uint8_t single_qprob = 0;
@@ -460,26 +486,26 @@ private:
                 while (b < pos[g + 1]) cell[g] += m_queue[b++].m_stats;
         }
 
-        // dp[k] = min total bytes to encode blocks [0, pos[k]) with boundaries only at candidates.
-        constexpr uint64_t INF = SWIFTHINTS_SEGMENT_INF;
-        std::vector<uint64_t> dp(pos.size(), INF);
+        // dp[k] = min total cost to encode blocks [0, pos[k]) with boundaries only at candidates.
+        constexpr SwiftHintsCost INF = SWIFTHINTS_COST_INF;
+        std::vector<SwiftHintsCost> dp(pos.size(), INF);
         std::vector<size_t> prev(pos.size(), 0);
-        dp[0] = 0;
+        dp[0] = {0, 0};
         for (size_t k = 1; k < pos.size(); k++) {
             SwiftHintsGroupStats seg;
             for (size_t m = k; m-- > 0;) {
                 seg += cell[m];
                 if (pos[k] - pos[m] > (size_t)MAX_BLOCKS_PER_GROUP) break;
-                uint64_t seg_total = SwiftHintsSegmentBytes(seg, pos[k] - pos[m]);
-                if (seg_total == INF) break; // bitstream only grows; once no mode fits, stop
-                if (dp[m] == INF) continue;
-                uint64_t c = dp[m] + seg_total;
+                SwiftHintsCost seg_total = SwiftHintsSegmentCost(seg, pos[k] - pos[m]);
+                if (seg_total.IsInf()) break; // bitstream only grows; once no mode fits, stop
+                if (dp[m].IsInf()) continue;
+                SwiftHintsCost c = dp[m] + seg_total;
                 if (c < dp[k]) { dp[k] = c; prev[k] = m; }
             }
         }
         // Largest candidate reachable by a valid partition (normally the last; safety net otherwise).
         size_t kmax = pos.size() - 1;
-        while (kmax > 0 && dp[kmax] == INF) --kmax;
+        while (kmax > 0 && dp[kmax].IsInf()) --kmax;
 
         // Reconstruct the partition of [0, pos[kmax]) front to back.
         std::vector<size_t> chain;
@@ -492,29 +518,29 @@ private:
         std::vector<size_t> B(chain.size());
         for (size_t j = 0; j < chain.size(); j++) B[j] = pos[chain[j]];
 
-        auto seg_cost = [&](size_t a, size_t c) -> uint64_t {
+        auto seg_cost = [&](size_t a, size_t c) -> SwiftHintsCost {
             SwiftHintsGroupStats s;
             for (size_t b = a; b < c; b++) s += m_queue[b].m_stats;
-            return SwiftHintsSegmentBytes(s, c - a);
+            return SwiftHintsSegmentCost(s, c - a);
         };
-        // Best block at which to split [a, c) into [a, p) + [p, c): {min combined size, p}.
-        auto best_split = [&](size_t a, size_t c) -> std::pair<uint64_t, size_t> {
+        // Best block at which to split [a, c) into [a, p) + [p, c): {min combined cost, p}.
+        auto best_split = [&](size_t a, size_t c) -> std::pair<SwiftHintsCost, size_t> {
             SwiftHintsGroupStats segL; segL += m_queue[a].m_stats;          // [a, a+1)
             SwiftHintsGroupStats segR;
             for (size_t b = a + 1; b < c; b++) segR += m_queue[b].m_stats;  // [a+1, c)
-            uint64_t best = INF; size_t bestp = a + 1;
+            SwiftHintsCost best = INF; size_t bestp = a + 1;
             for (size_t p = a + 1; p < c; p++) {
-                uint64_t t1 = SwiftHintsSegmentBytes(segL, p - a);          // [a, p); grows with p
-                if (t1 == INF) break;
-                uint64_t t2 = SwiftHintsSegmentBytes(segR, c - p);          // [p, c); shrinks with p
-                if (t2 != INF && t1 + t2 < best) { best = t1 + t2; bestp = p; }
+                SwiftHintsCost t1 = SwiftHintsSegmentCost(segL, p - a);     // [a, p); grows with p
+                if (t1.IsInf()) break;
+                SwiftHintsCost t2 = SwiftHintsSegmentCost(segR, c - p);     // [p, c); shrinks with p
+                if (!t2.IsInf() && t1 + t2 < best) { best = t1 + t2; bestp = p; }
                 if (p + 1 < c) { segL += m_queue[p].m_stats; segR -= m_queue[p].m_stats; }
             }
             return {best, bestp};
         };
 
         // One refinement pass: walk back to front, alternating split-group and move/merge-split. Every
-        // applied operation strictly lowers the total estimated size, so a pass terminates.
+        // applied operation strictly lowers the total estimated cost, so a pass terminates.
         auto refine_pass = [&]() {
             size_t i = B.size() - 1; // group under consideration is [B[i-1], B[i])
             while (i >= 1) {
@@ -527,11 +553,11 @@ private:
                 }
                 if (i >= 2) { // B[i-1] is an internal split
                     const size_t a = B[i - 2], b = B[i - 1], c = B[i];
-                    const uint64_t cab = seg_cost(a, b), cbc = seg_cost(b, c);
-                    const uint64_t cur = (cab == INF || cbc == INF) ? INF : cab + cbc;
-                    const uint64_t rm = seg_cost(a, c);    // remove the split, merge into one group
-                    auto [mb, mp] = best_split(a, c);      // best alternative split position (includes b)
-                    if (rm != INF && (mb == INF || rm <= mb) && rm < cur) {
+                    const SwiftHintsCost cab = seg_cost(a, b), cbc = seg_cost(b, c);
+                    const SwiftHintsCost cur = (cab.IsInf() || cbc.IsInf()) ? INF : cab + cbc;
+                    const SwiftHintsCost rm = seg_cost(a, c);  // remove the split, merge into one group
+                    auto [mb, mp] = best_split(a, c);          // best alternative split position (includes b)
+                    if (!rm.IsInf() && (mb.IsInf() || rm <= mb) && rm < cur) {
                         B.erase(B.begin() + (i - 1));       // merge
                         --i;
                         continue;
