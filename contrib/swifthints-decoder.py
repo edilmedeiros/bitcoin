@@ -29,19 +29,19 @@ block boundaries, so a caller drives the file decoder block by block:
 from __future__ import annotations
 
 # Number of probability contexts; see "Context model" in doc/swifthints.md.
-NUM_CONTEXTS: int = 144
+NUM_CONTEXTS: int = 105
 
 
 def swifthints_context(n: int, i: int, spent: int) -> int:
-    """Return the context index (0..143) for output ``i`` of a transaction with
+    """Return the context index (0..104) for output ``i`` of a transaction with
     ``n`` outputs, given that ``spent`` of the earlier outputs (indices < i) are
     spent. Identical to SwiftHintsContext() in the C++ source.
     """
-    s = min(n, 8) - 1   # size class, 0..7
-    p = min(i, 7)       # position class, 0..7
-    if p < 7:
+    s = min(n, 7) - 1   # size class, 0..6
+    p = min(i, 6)       # position class, 0..6
+    if p < 6:
         return s * (s + 1) * (s + 2) // 6 + p * (p + 1) // 2 + spent
-    return 112 + min(spent * 32 // i, 31)
+    return 77 + min(spent * 28 // i, 27)
 
 
 class ANSDecoder:
@@ -81,35 +81,34 @@ class SwiftHintsDecoder:
     header. Matches ``class SwiftHintDecoder``.
 
     Constructed from the whole file buffer ``data`` and the ``offset`` of the
-    group's first byte. It recognizes the full vs compact mode itself (the high bit
-    of that first byte), reads the block count, bitstream size and probability
-    table, and replicates the single shared byte across all contexts for a compact
-    group. After construction, ``nblocks`` is the number of blocks the group covers
-    and ``group_size`` the number of bytes it occupies (so the caller can advance to
-    the next group).
+    group's first byte. The first two bytes are the size field (total group size
+    minus those two bytes), which directly gives ``group_size``; the next two bytes
+    are the count field (low 15 bits = blocks-1, top bit = mode flag). It reads the
+    probability table (replicating the single shared byte across all contexts for a
+    compact group). After construction, ``nblocks`` is the number of blocks the group
+    covers and ``group_size`` the number of bytes it occupies (so the caller can
+    advance to the next group).
     """
 
     def __init__(self, data: bytes, offset: int) -> None:
         if offset + 4 > len(data):
             raise EOFError("unexpected end of file inside a group header")
-        b0 = data[offset]
-        self.compact: bool = bool(b0 & 0x80)
-        if self.compact:
-            # Compact: 7-bit block count, 2-byte size, one shared probability byte.
-            bitstream_size = data[offset + 1] | (data[offset + 2] << 8)
-            self._qprob: bytes = bytes([data[offset + 3]]) * NUM_CONTEXTS
-            self.nblocks: int = (b0 & 0x7F) + 1
-            body_off = offset + 4
-        else:
-            # Full: 15-bit big-endian block count, 2-byte size, 144 probabilities.
-            bitstream_size = data[offset + 2] | (data[offset + 3] << 8)
-            self._qprob = bytes(data[offset + 4:offset + 4 + NUM_CONTEXTS])
-            self.nblocks = (((b0 & 0x7F) << 8) | data[offset + 1]) + 1
-            body_off = offset + 4 + NUM_CONTEXTS
-        end = body_off + 3 + bitstream_size
-        if end > len(data):
+        size_field = data[offset] | (data[offset + 1] << 8)
+        count = data[offset + 2] | (data[offset + 3] << 8)
+        self.group_size: int = 2 + size_field
+        self.compact: bool = bool(count & 0x8000)
+        self.nblocks: int = (count & 0x7FFF) + 1
+        prob_bytes = 1 if self.compact else NUM_CONTEXTS
+        end = offset + self.group_size
+        if 4 + prob_bytes + 3 > self.group_size or end > len(data):
             raise EOFError("unexpected end of file inside a group")
-        self.group_size: int = end - offset
+        if self.compact:
+            # Compact: a single shared probability, replicated across all contexts.
+            self._qprob: bytes = bytes([data[offset + 4]]) * NUM_CONTEXTS
+        else:
+            # Full: NUM_CONTEXTS per-context probabilities.
+            self._qprob = bytes(data[offset + 4:offset + 4 + NUM_CONTEXTS])
+        body_off = offset + 4 + prob_bytes  # start of [3-byte state][bitstream]
         self._ans: ANSDecoder = ANSDecoder(data[body_off:end])
 
     def decode_tx(self, num_outputs: int) -> list[bool]:

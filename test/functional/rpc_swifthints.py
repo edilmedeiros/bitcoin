@@ -113,6 +113,11 @@ class SwiftHintsTest(BitcoinTestFramework):
         assert "U" in rec and "s" in rec
         assert_equal(rec.count("\n"), height + 1)  # one line per block, genesis..tip
 
+        self.log.info("fastdump produces a byte-identical record to dump")
+        df = node.swifthints(command="fastdump", blockhash=tip, record="rec_fast.txt")
+        assert_equal(df, d)  # same {blocks, outputs}
+        assert_equal(self.read_record("rec_fast.txt"), rec)
+
         self.log.info("encode (standalone tool), then decode (RPC) and compare")
         e = self.encode("rec.txt", "sh.dat")
         assert e is not None
@@ -154,6 +159,9 @@ class SwiftHintsTest(BitcoinTestFramework):
         rec_e = self.read_record("rec_e.txt")
         assert_equal(rec_e.count("\n"), early_height + 1)
         assert rec_e != rec  # different target height -> different unspent set
+        # fastdump must agree with dump at this earlier height too.
+        node.swifthints(command="fastdump", blockhash=early_hash, record="rec_e_fast.txt")
+        assert_equal(self.read_record("rec_e_fast.txt"), rec_e)
         assert self.encode("rec_e.txt", "sh_e.dat") is not None
         node.swifthints(command="decode", blockhash=early_hash, swifthints="sh_e.dat", record="rec_e_dec.txt")
         assert_equal(self.read_record("rec_e_dec.txt"), rec_e)
@@ -175,6 +183,8 @@ class SwiftHintsTest(BitcoinTestFramework):
                                 node.swifthints, command="dump", record="x.txt")
         assert_raises_rpc_error(-8, "'dump' requires the 'record' argument",
                                 node.swifthints, command="dump", blockhash=tip)
+        assert_raises_rpc_error(-8, "'fastdump' requires the 'record' argument",
+                                node.swifthints, command="fastdump", blockhash=tip)
         assert_raises_rpc_error(-8, "'decode' requires the 'swifthints' argument",
                                 node.swifthints, command="decode", blockhash=tip, record="x.txt")
         assert_raises_rpc_error(-8, "'decode' requires the 'record' argument",

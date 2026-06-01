@@ -44,15 +44,16 @@ namespace {
 // Context model -- duplicated from the decoder; must produce identical contexts.
 // ===========================================================================
 
-constexpr int SWIFTHINTS_NUM_CONTEXTS = 144;
+// The encoding uses 105 probability contexts (see doc/swifthints.md for the model).
+constexpr int SWIFTHINTS_NUM_CONTEXTS = 105;
 
-// Context (0..143) for output i of a transaction with n outputs, given that `spent` of the earlier
+// Context (0 .. 104) for output i of a transaction with n outputs, given that `spent` of the earlier
 // outputs in the same transaction are spent.
 int SwiftHintsContext(int n, int i, int spent) noexcept {
-    int s = std::min(n, 8) - 1;
-    int p = std::min(i, 7);
-    if (p < 7) return s * (s + 1) * (s + 2) / 6 + p * (p + 1) / 2 + spent;
-    return 112 + std::min(spent * 32 / i, 31);
+    int s = std::min(n, 7) - 1;
+    int p = std::min(i, 6);
+    if (p < 6) return s * (s + 1) * (s + 2) / 6 + p * (p + 1) / 2 + spent;
+    return 77 + std::min(spent * 28 / i, 27);
 }
 
 // ===========================================================================
@@ -61,19 +62,21 @@ int SwiftHintsContext(int n, int i, int spent) noexcept {
 
 // Lookahead window: the group-boundary DP runs once the queue holds at least num_candidates blocks and
 // SWIFTHINTS_MIN_BYTES of estimated unsplit encoded size, or a hard cap is hit. The byte target is a
-// flat absolute value (a parameter sweep on a full mainnet chain found the encoded size within ~0.02%
-// of optimal for any window above ~150 KiB, so 240'000 leaves headroom as the chain grows).
+// flat absolute value (empirically, on a full mainnet chain the encoded size is within ~0.02% of
+// optimal for any window above ~150 KiB, so 240'000 leaves headroom as the chain grows).
 constexpr size_t SWIFTHINTS_HARD_BLOCK_LIMIT = 150'000;
 constexpr uint64_t SWIFTHINTS_HARD_OUTPUT_LIMIT = 100'000'000;
 constexpr uint64_t SWIFTHINTS_MIN_BYTES = 240'000;
 constexpr size_t SWIFTHINTS_DEFAULT_NUM_CANDIDATES = 256;
 
-// A full-mode group stores (blocks - 1) in a 15-bit field; a compact-mode group in 7 bits.
+// Both group modes store (blocks - 1) in the low 15 bits of the 2-byte count field (the top bit holds
+// the mode flag), so a group spans at most 32768 blocks.
 constexpr int MAX_BLOCKS_PER_GROUP = 32768;
-constexpr size_t MAX_BLOCKS_PER_GROUP_COMPACT = 128;
-// Largest rANS bitstream per group; the header size field is a uint16_t and the small margin absorbs
-// the gap between the entropy estimate and the actual encoded size.
-constexpr uint64_t SWIFTHINTS_MAX_BITSTREAM_BYTES = 0xFFFF - 64;
+// Largest (ANS state + bitstream) per group. The 2-byte size field stores (total group size - 2) =
+// count + probabilities + state + bitstream and is a uint16_t, so for a full group the state+bitstream
+// must fit in 0xFFFF - 2(count) - SWIFTHINTS_NUM_CONTEXTS; the 4-byte margin absorbs the gap between
+// the entropy estimate and the actual encoded size (re-checked exactly at emit).
+constexpr uint64_t SWIFTHINTS_MAX_BITSTREAM_BYTES = 0xFFFF - 2 - SWIFTHINTS_NUM_CONTEXTS - 4;
 
 // Coding costs are integers in units of 1/2^32 of a bit, so all decisions are deterministic and free
 // of floating point. A total coded size up to 512 MiB (2^32 bits) fits in a uint64_t.
@@ -216,20 +219,20 @@ constexpr SwiftHintsCost SWIFTHINTS_COST_INF{std::numeric_limits<uint64_t>::max(
 // mode's cost is {rounded bytes, unrounded units = header*8 + bitstream-bits-incl-state}; the cheaper
 // is chosen by SwiftHintsCost's lexicographic order, so a tie on rounded size falls back to the
 // bit-precise total and an exact tie keeps full mode. The cost is SWIFTHINTS_COST_INF if neither mode
-// fits (bitstream over the 16-bit field, or too many blocks). Full mode pays 2+2+144 header bytes,
-// compact mode 1+2+1.
+// fits (group over the 16-bit size field, or too many blocks). Both modes pay a 4-byte header (2-byte
+// size + 2-byte count); full mode then has a NUM_CONTEXTS-byte probability table, compact mode 1 byte.
 struct SwiftHintsModeCost { SwiftHintsCost cost; bool compact; };
 SwiftHintsModeCost SwiftHintsChooseMode(const SwiftHintsGroupStats& seg, size_t nblocks) {
     constexpr uint64_t U = SWIFTHINTS_COST_UNIT;
     SwiftHintsCost full = SWIFTHINTS_COST_INF, compact = SWIFTHINTS_COST_INF;
     if (nblocks <= (size_t)MAX_BLOCKS_PER_GROUP) {
-        constexpr uint64_t H = 2 + 2 + SWIFTHINTS_NUM_CONTEXTS;
+        constexpr uint64_t H = 2 + 2 + SWIFTHINTS_NUM_CONTEXTS; // size + count + per-context table
         uint64_t bu = seg.BitstreamUnitsFull();
         uint64_t bb = SwiftHintsGroupStats::UnitsToBytes(bu);
         if (bb <= SWIFTHINTS_MAX_BITSTREAM_BYTES) full = {bb + H, H * 8 * U + bu};
     }
-    if (nblocks <= MAX_BLOCKS_PER_GROUP_COMPACT) {
-        constexpr uint64_t H = 1 + 2 + 1;
+    if (nblocks <= (size_t)MAX_BLOCKS_PER_GROUP) {
+        constexpr uint64_t H = 2 + 2 + 1; // size + count + single shared probability
         uint64_t bu = seg.BitstreamUnitsSingle();
         uint64_t bb = SwiftHintsGroupStats::UnitsToBytes(bu);
         if (bb <= SWIFTHINTS_MAX_BITSTREAM_BYTES) compact = {bb + H, H * 8 * U + bu};
@@ -367,7 +370,7 @@ private:
         }
 
         // Pick the cheaper of the two encodings, using the same cost model and tie-breaking as the
-        // boundary search. Compact mode (one shared probability instead of the 144-byte table) is only
+        // boundary search. Compact mode (one shared probability instead of the per-context table) is only
         // available for short groups, and is chosen only when it is strictly cheaper.
         bool compact = SwiftHintsChooseMode(gstats, nblocks).compact;
 
@@ -384,28 +387,22 @@ private:
         }
         auto enc = enc_ans.Finish(); // [3-byte ANS state][bitstream]
 
-        if (enc.size() - 3 > 0xFFFF) throw std::runtime_error("Group bitstream too large for the file format");
-        uint16_t bitstream_size = (uint16_t)(enc.size() - 3);
-        size_t header_bytes;
-        if (compact) {
-            // 1-byte count (high bit set as the mode flag, low 7 bits = blocks-1), 2-byte size, 1 prob.
-            put_u8(m_out, (uint8_t)(0x80 | (nblocks - 1)));
-            put_u16le(m_out, bitstream_size);
-            put_u8(m_out, single_qprob);
-            header_bytes = 1 + 2 + 1;
-        } else {
-            // 2-byte count (high bit clear, remaining 15 bits = blocks-1, big-endian), 2-byte size,
-            // 144-byte probability table.
-            uint16_t nblocks_m1 = (uint16_t)(nblocks - 1);
-            put_u8(m_out, (uint8_t)((nblocks_m1 >> 8) & 0x7F));
-            put_u8(m_out, (uint8_t)(nblocks_m1 & 0xFF));
-            put_u16le(m_out, bitstream_size);
-            m_out.write((const char*)qprob.data(), (std::streamsize)qprob.size());
-            header_bytes = 2 + 2 + SWIFTHINTS_NUM_CONTEXTS;
-        }
+        // Group layout: [size: u16 LE][count: u16 LE][probabilities][ANS state + bitstream].
+        //  - size  = total group size minus the 2-byte size field itself
+        //          = 2 (count) + probability-table bytes + enc.size().
+        //  - count = (blocks - 1) in the low 15 bits; top bit is the mode flag (set = compact).
+        // The size field lets a reader skip a whole group, and the count gives its block span, without
+        // understanding the probability/rANS payload.
+        const size_t prob_bytes = compact ? 1 : SWIFTHINTS_NUM_CONTEXTS;
+        const size_t size_field = 2 + prob_bytes + enc.size();
+        if (size_field > 0xFFFF) throw std::runtime_error("Group too large for the file format");
+        put_u16le(m_out, (uint16_t)size_field);
+        put_u16le(m_out, (uint16_t)((compact ? 0x8000u : 0u) | (uint32_t)(nblocks - 1)));
+        if (compact) put_u8(m_out, single_qprob);
+        else m_out.write((const char*)qprob.data(), (std::streamsize)qprob.size());
         m_out.write((const char*)enc.data(), (std::streamsize)enc.size());
 
-        size_t group_bytes = header_bytes + enc.size();
+        size_t group_bytes = 2 + size_field;
         m_nbytes += group_bytes;
         m_nout_encoded += group_outputs;
 
@@ -603,7 +600,7 @@ private:
 EncodeResult ParseRecordFile(std::istream& fin, std::ostream& out, size_t num_candidates)
 {
     SwiftHintsEncoder enc(out, num_candidates);
-    std::vector<uint8_t> unspents; // reused per-transaction scratch buffer
+    std::vector<uint8_t> unspents; // reused per-transaction scratch buffer (1='U', 0='s')
     std::string line;
     size_t lineno = 0;
     while (std::getline(fin, line)) {

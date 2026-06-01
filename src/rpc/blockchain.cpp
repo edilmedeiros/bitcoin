@@ -3223,9 +3223,9 @@ namespace {
 // ===========================================================================
 
 /** Total number of contexts the encoding uses. */
-constexpr int SWIFTHINTS_NUM_CONTEXTS = 144;
+constexpr int SWIFTHINTS_NUM_CONTEXTS = 105;
 
-/** Compute which context (0..143) to use for a specific output.
+/** Compute which context (0..104) to use for a specific output.
  *
  * n:     total number of outputs in transaction.
  * i:     position of the current output.
@@ -3233,21 +3233,21 @@ constexpr int SWIFTHINTS_NUM_CONTEXTS = 144;
  *
  * See the file format comment below for the meaning of the size/position/spent classes.
  * The per-class offsets are tetrahedral numbers (size) and triangular numbers (position);
- * the result is always in [0, 143] (the p<7 branch reaches at most 111, the p==7 branch
- * covers 112..143).
+ * the result is always in [0, 104] (the p<6 branch reaches at most 76, the p==6 branch
+ * covers 77..104).
  */
 int SwiftHintsContext(int n, int i, int spent) noexcept {
-    int s = std::min(n, 8) - 1;
-    int p = std::min(i, 7);
-    if (p < 7) return s * (s + 1) * (s + 2) / 6 + p * (p + 1) / 2 + spent;
-    return 112 + std::min(spent * 32 / i, 31);
+    int s = std::min(n, 7) - 1;
+    int p = std::min(i, 6);
+    if (p < 6) return s * (s + 1) * (s + 2) / 6 + p * (p + 1) / 2 + spent;
+    return 77 + std::min(spent * 28 / i, 27);
 }
 
 /** Writes the human-readable record format: one line per block, of the form
- *  "<height> <block_hash>: <tx> <tx> ...", where each <tx> is a string of 'U' (unspent) and
- *  's' (spent), one character per output. Outputs are fed in one at a time via Output(); a new
- *  transaction is detected by out_idx returning to 0. (Transactions with zero outputs, which
- *  consensus forbids, would not appear.) */
+ *  "<height> <block_hash>: <tx> <tx> ...", where each <tx> is a string of 'U' (unspent) and 's'
+ *  (spent), one character per output. Outputs are fed in one at a time via Output(); a new transaction
+ *  is detected by out_idx returning to 0. (Transactions with zero outputs, which consensus forbids,
+ *  would not appear.) */
 struct SwiftHintsRecordWriter {
     AutoFile& m_file;
     int m_cur_height = -1;
@@ -3326,24 +3326,23 @@ class SwiftHintDecoder {
     };
     static Header ParseHeader(std::span<const uint8_t> group) {
         Header h;
-        const uint8_t b0 = group[0];
-        h.compact = (b0 & 0x80) != 0;
-        uint16_t bitstream_size;
-        size_t body_off;
+        // group[0..1] is the size field (used by the framing layer to delimit the group; not needed
+        // here). group[2..3] is the count field: low 15 bits = blocks-1, top bit = mode flag.
+        if (group.size() < 4) throw JSONRPCError(RPC_INTERNAL_ERROR, "Corrupt swifthints: group too short");
+        const uint16_t count = (uint16_t)group[2] | ((uint16_t)group[3] << 8);
+        h.compact = (count & 0x8000) != 0;
+        h.nblocks = (count & 0x7FFF) + 1;
+        const size_t prob_bytes = h.compact ? 1 : SWIFTHINTS_NUM_CONTEXTS;
+        if (group.size() < 4 + prob_bytes + 3) // size + count + probabilities + 3-byte state (minimum)
+            throw JSONRPCError(RPC_INTERNAL_ERROR, "Corrupt swifthints: group too short");
         if (h.compact) {
-            // Compact: 7-bit block count, 2-byte size, one shared probability replicated everywhere.
-            bitstream_size = (uint16_t)group[1] | ((uint16_t)group[2] << 8);
-            h.qprob.fill(group[3]);
-            h.nblocks = (b0 & 0x7F) + 1;
-            body_off = 1 + 2 + 1;
+            // Compact: one shared probability, replicated across all contexts.
+            h.qprob.fill(group[4]);
         } else {
-            // Full: 15-bit big-endian block count, 2-byte size, 144 per-context probabilities.
-            bitstream_size = (uint16_t)group[2] | ((uint16_t)group[3] << 8);
+            // Full: SWIFTHINTS_NUM_CONTEXTS per-context probabilities.
             std::copy_n(group.begin() + 4, SWIFTHINTS_NUM_CONTEXTS, h.qprob.begin());
-            h.nblocks = (((int)(b0 & 0x7F) << 8) | group[1]) + 1;
-            body_off = 2 + 2 + SWIFTHINTS_NUM_CONTEXTS;
         }
-        h.ans = group.subspan(body_off, 3 + bitstream_size);
+        h.ans = group.subspan(4 + prob_bytes); // [3-byte state][bitstream] -- the rest of the group
         return h;
     }
 
@@ -3403,42 +3402,33 @@ UniValue SwiftHintsDecode(NodeContext& node, const CBlockIndex* target_index, co
     int gstart = 0;
     size_t group_txs = 0, group_outputs = 0, group_unspent = 0, group_bytes = 0;
 
-    // Read the next group's raw bytes from the input file into group_data, verbatim and in on-disk
-    // order, and hand them to a SwiftHintDecoder, which parses the mode, block count and probabilities
-    // itself. A clean end-of-file before a group signals there are no more groups (returns false); a
-    // file that ends partway through a group is corrupt and throws (a read below fails). The reader only
-    // peeks the mode bit and size, to know how many bytes the group occupies on disk.
+    // Read the next group's raw bytes from the input file into group_data and hand them to a
+    // SwiftHintDecoder, which parses the count/mode/probabilities itself. The framing here is
+    // format-agnostic: the first two bytes are the group's size field (total group size minus those two
+    // bytes), which is all that's needed to delimit the group. A clean end-of-file before a group
+    // signals there are no more groups (returns false); a file that ends partway through a group is
+    // corrupt and throws (a read below fails).
     auto next_group = [&]() -> bool {
-        // The first byte holds the mode flag and part of the block count; read it on its own so a clean
-        // EOF here (no more groups) is distinguishable from a truncated group (corruption, throws below).
-        uint8_t b0;
+        // Read the first size byte on its own so a clean EOF here (no more groups) is distinguishable
+        // from a truncated group (corruption, throws below).
+        uint8_t s0;
         try {
-            fin >> b0;
+            fin >> s0;
         } catch (const std::ios_base::failure&) {
             return false;
         }
+        uint8_t s1;
+        fin >> s1;
+        const size_t total = 2 + ((size_t)s0 | ((size_t)s1 << 8));
         decoder.reset(); // release the previous decoder's view before reusing the buffer
-
-        // Every group has a 4-byte fixed prefix (b0 plus three more bytes); their meaning depends on the
-        // mode, but the 2-byte size field and -- for a full group -- the 144 probabilities follow it.
-        uint8_t h1, h2, h3;
-        fin >> h1 >> h2 >> h3;
-        uint16_t bitstream_size;
-        size_t prob_bytes;
-        if (b0 & 0x80) { // compact: h1,h2 = size; h3 = the single shared probability
-            bitstream_size = (uint16_t)h1 | ((uint16_t)h2 << 8);
-            prob_bytes = 0;
-        } else {         // full: h1 = high block-count byte; h2,h3 = size; 144 probabilities follow
-            bitstream_size = (uint16_t)h2 | ((uint16_t)h3 << 8);
-            prob_bytes = SWIFTHINTS_NUM_CONTEXTS;
-        }
-        group_data.resize(4 + prob_bytes + 3 + bitstream_size);
-        group_data[0] = b0; group_data[1] = h1; group_data[2] = h2; group_data[3] = h3;
-        fin.read(MakeWritableByteSpan(group_data).subspan(4)); // probabilities (full only) + state + bitstream
+        group_data.resize(total);
+        group_data[0] = s0;
+        group_data[1] = s1;
+        fin.read(MakeWritableByteSpan(group_data).subspan(2)); // count + probabilities + state + bitstream
 
         decoder.emplace(std::span<const uint8_t>{group_data});
         blocks_left = decoder->BlockCount();
-        group_bytes = group_data.size();
+        group_bytes = total;
         nbytes += group_bytes;
         ngroups++;
         group_txs = 0; group_outputs = 0; group_unspent = 0;
@@ -3505,14 +3495,25 @@ UniValue SwiftHintsDecode(NodeContext& node, const CBlockIndex* target_index, co
 
 /** Iterate every output from genesis up to target_index, in block/transaction/output order.
  *
- *  For each output, visitor() is called with its location and unspent-ness (determined from
- *  utxo_view, which must hold the UTXO set as of target_index). After each block, block_done()
- *  is called with that block's height. */
+ *  The caller supplies an "unspent oracle": block_begin(height) is called once before each block's
+ *  outputs are queried (a hook for any per-block preparation), and is_unspent(height, outpoint)
+ *  answers whether a given output is unspent at the target height. For each output, visitor(height,
+ *  block_hash, tx_idx, out_idx, n_outputs, is_unspent, ctx) is then called. After each block,
+ *  block_done(height) is called. The callbacks are template parameters so they inline (no
+ *  std::function wrapping):
+ *    BlockBegin: void(int height)
+ *    IsUnspent:  bool(int height, const COutPoint& op)
+ *    Visitor:    void(int height, const uint256& block_hash, int tx_idx, int out_idx, int n_outputs,
+ *                     bool is_unspent, int ctx)
+ *    BlockDone:  void(int height) */
+template <typename BlockBegin, typename IsUnspent, typename Visitor, typename BlockDone>
 void SwiftHintsIterateOutputs(
-    NodeContext& node, ChainstateManager& chainman, CCoinsViewCache& utxo_view,
+    NodeContext& node, ChainstateManager& chainman,
     const CBlockIndex* target_index,
-    const std::function<void(int height, const uint256& block_hash, int tx_idx, int out_idx, int n_outputs, bool is_unspent, int ctx)>& visitor,
-    const std::function<void(int height)>& block_done)
+    BlockBegin block_begin,
+    IsUnspent is_unspent,
+    Visitor visitor,
+    BlockDone block_done)
 {
     for (int height = 0; height <= target_index->nHeight; height++) {
         node.rpc_interruption_point();
@@ -3521,11 +3522,7 @@ void SwiftHintsIterateOutputs(
         CBlock block;
         if (!chainman.m_blockman.ReadBlock(block, *block_index))
             throw JSONRPCError(RPC_INTERNAL_ERROR, strprintf("Failed to read block at height %d", height));
-        // Outputs spent by inputs within this same block count as spent.
-        std::set<COutPoint> spent_in_block;
-        for (const auto& tx : block.vtx)
-            if (!tx->IsCoinBase())
-                for (const auto& txin : tx->vin) spent_in_block.insert(txin.prevout);
+        block_begin(height);
         for (int tx_idx = 0; tx_idx < (int)block.vtx.size(); tx_idx++) {
             const auto& tx = block.vtx[tx_idx];
             const Txid& txid = tx->GetHash();
@@ -3533,9 +3530,9 @@ void SwiftHintsIterateOutputs(
             int spent_before = 0;
             for (int i = 0; i < n; i++) {
                 int ctx = SwiftHintsContext(n, i, spent_before);
-                bool is_unspent = !spent_in_block.count(COutPoint(txid, i)) && utxo_view.HaveCoin(COutPoint(txid, i));
-                visitor(height, block_index->GetBlockHash(), tx_idx, i, n, is_unspent, ctx);
-                if (!is_unspent) spent_before++;
+                bool unspent = is_unspent(height, COutPoint(txid, i));
+                visitor(height, block_index->GetBlockHash(), tx_idx, i, n, unspent, ctx);
+                if (!unspent) spent_before++;
             }
         }
         block_done(height);
@@ -3643,18 +3640,23 @@ struct SwiftHintsRollback {
           m_view{m_db.get()} {}
 };
 
-/** Implementation of the "dump" subcommand: write a human-readable record file. */
-UniValue SwiftHintsDump(NodeContext& node, const ArgsManager& args, const CBlockIndex* target_index, const fs::path& file1)
+/** Open the record file and write it by iterating outputs genesis..target_index, using the supplied
+ *  unspent oracle (block_begin + is_unspent). Shared by "dump" and "fastdump", which differ only in
+ *  how they answer "is this output unspent?". The oracle callbacks are template parameters so they
+ *  inline all the way into the per-output loop (no std::function wrapping); see
+ *  SwiftHintsIterateOutputs for their signatures. The caller must already have built the rolled-back
+ *  UTXO set the oracle relies on. */
+template <typename BlockBegin, typename IsUnspent>
+UniValue SwiftHintsWriteRecord(
+    NodeContext& node, const CBlockIndex* target_index, const fs::path& file1,
+    BlockBegin block_begin,
+    IsUnspent is_unspent)
 {
-    if (fs::exists(file1)) throw JSONRPCError(RPC_INVALID_PARAMETER, file1.utf8string() + " already exists.");
-
-    SwiftHintsRollback rollback(node, node.chainman->ActiveChainstate(), target_index, args);
-
     AutoFile afile{fsbridge::fopen(file1, "w")};
     if (afile.IsNull()) throw JSONRPCError(RPC_INVALID_PARAMETER, "Cannot open " + file1.utf8string());
     SwiftHintsRecordWriter writer{afile};
     size_t nout = 0;
-    SwiftHintsIterateOutputs(node, *node.chainman, rollback.m_view, target_index,
+    SwiftHintsIterateOutputs(node, *node.chainman, target_index, block_begin, is_unspent,
         [&](int h, const uint256& bh, int tx, int out, int n, bool u, int ctx) {
             writer.Output(h, bh, tx, out, n, u, ctx);
             nout++;
@@ -3669,6 +3671,55 @@ UniValue SwiftHintsDump(NodeContext& node, const ArgsManager& args, const CBlock
     return r;
 }
 
+/** Implementation of the "dump" subcommand: write a human-readable record file. Each output's
+ *  unspent-ness is answered by a direct lookup in the rolled-back UTXO set. */
+UniValue SwiftHintsDump(NodeContext& node, const ArgsManager& args, const CBlockIndex* target_index, const fs::path& file1)
+{
+    if (fs::exists(file1)) throw JSONRPCError(RPC_INVALID_PARAMETER, file1.utf8string() + " already exists.");
+
+    SwiftHintsRollback rollback(node, node.chainman->ActiveChainstate(), target_index, args);
+
+    return SwiftHintsWriteRecord(node, target_index, file1,
+        /*block_begin=*/[](int) {},
+        /*is_unspent=*/[&](int, const COutPoint& op) { return rollback.m_view.HaveCoin(op); });
+}
+
+/** Implementation of the "fastdump" subcommand: same behavior and output as "dump", but it avoids a
+ *  random UTXO lookup per output. After the same snapshot+rewind, it scans the rolled-back UTXO
+ *  database once, in its natural key order, bucketing every unspent outpoint by the height of the
+ *  block that created it (Coin::nHeight). Then, walking the chain, it sorts each block's bucket and
+ *  answers unspent-ness by binary search within it. */
+UniValue SwiftHintsDumpFast(NodeContext& node, const ArgsManager& args, const CBlockIndex* target_index, const fs::path& file1)
+{
+    if (fs::exists(file1)) throw JSONRPCError(RPC_INVALID_PARAMETER, file1.utf8string() + " already exists.");
+
+    SwiftHintsRollback rollback(node, node.chainman->ActiveChainstate(), target_index, args);
+
+    // One bucket per block height; each holds the still-unspent outpoints created at that height.
+    LogInfo("swifthints fastdump: bucketing the UTXO set by creation height");
+    std::vector<std::vector<COutPoint>> buckets(target_index->nHeight + 1);
+    {
+        std::unique_ptr<CCoinsViewCursor> cursor{rollback.m_db->Cursor()};
+        size_t coins_count = 0;
+        for (; cursor->Valid(); cursor->Next()) {
+            node.rpc_interruption_point();
+            COutPoint key;
+            Coin coin;
+            if (cursor->GetKey(key) && cursor->GetValue(coin) && coin.nHeight < buckets.size()) {
+                buckets[coin.nHeight].push_back(key);
+                ++coins_count;
+            }
+        }
+        LogInfo("swifthints fastdump: %u unspent outputs bucketed", coins_count);
+    }
+
+    return SwiftHintsWriteRecord(node, target_index, file1,
+        // Sort this height's bucket once, just before its outputs are queried.
+        /*block_begin=*/[&](int h) { std::sort(buckets[h].begin(), buckets[h].end()); },
+        // An output is unspent iff it is present in the (now sorted) bucket for its creation height.
+        /*is_unspent=*/[&](int h, const COutPoint& op) { return std::binary_search(buckets[h].begin(), buckets[h].end(), op); });
+}
+
 
 } // namespace
 
@@ -3676,7 +3727,7 @@ UniValue SwiftHintsDump(NodeContext& node, const ArgsManager& args, const CBlock
  * SwiftHints file format (.dat)
  *
  * The on-disk format -- the concatenation of independently decodable groups, the full/compact group
- * modes selected by the first byte's high bit, the 144-context model, the quantized probabilities,
+ * modes selected by the first byte's high bit, the 105-context model, the quantized probabilities,
  * and the byte-wise rANS coding -- is documented in full in doc/swifthints.md. The decoder above
  * (ANSDecoder / SwiftHintDecoder / SwiftHintsDecode) is the reading side of that format; the encoding
  * side lives in the standalone bitcoin-swifthints tool (src/bitcoin-swifthints.cpp), and a
@@ -3690,12 +3741,16 @@ static RPCMethod swifthints()
         "Dump or decode the spent/unspent status of transaction outputs. (Encoding a record file into\n"
         "the binary format is done by the standalone bitcoin-swifthints tool, which needs no chain data.)\n"
         "Arguments are named and command-specific; passing them with `bitcoin-cli -named` is recommended.\n"
-        "  dump   (blockhash, record)\n"
+        "  dump     (blockhash, record)\n"
         "      Write a human-readable record file for outputs from genesis to blockhash (requires chain rewind).\n"
-        "  decode (blockhash, swifthints, record)\n"
+        "  fastdump (blockhash, record)\n"
+        "      Like dump, with identical output, but determines unspent outputs by bucketing the UTXO set\n"
+        "      by creation height and binary-searching, instead of a lookup per output. Faster, but holds\n"
+        "      every unspent outpoint in memory at once, so it needs a lot of RAM (many GB on mainnet).\n"
+        "  decode   (blockhash, swifthints, record)\n"
         "      Decode a binary swifthints file back into a record file for genesis..blockhash (no rewind).",
         {
-            {"command", RPCArg::Type::STR, RPCArg::Optional::NO, "One of: dump, decode"},
+            {"command", RPCArg::Type::STR, RPCArg::Optional::NO, "One of: dump, fastdump, decode"},
             {"blockhash", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED,
                 "The block hash to process up to"},
             {"record", RPCArg::Type::STR, RPCArg::Optional::OMITTED,
@@ -3730,10 +3785,10 @@ static RPCMethod swifthints()
         return fsbridge::AbsPathJoin(args.GetDataDirNet(), fs::u8path(std::string{*v}));
     };
 
-    if (command != "dump" && command != "decode")
-        throw JSONRPCError(RPC_INVALID_PARAMETER, "Unknown command '" + command + "'. Use dump or decode.");
+    if (command != "dump" && command != "fastdump" && command != "decode")
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "Unknown command '" + command + "'. Use dump, fastdump or decode.");
 
-    // dump and decode both operate on the active chain up to a target block.
+    // All commands operate on the active chain up to a target block.
     const UniValue* blockhash{self.MaybeArg<UniValue>("blockhash")};
     if (!blockhash) throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("'%s' requires the 'blockhash' argument", command));
     const uint256 target_hash{ParseHashV(*blockhash, "blockhash")};
@@ -3747,6 +3802,7 @@ static RPCMethod swifthints()
     }
 
     if (command == "dump") return SwiftHintsDump(node, args, target_index, req_path("record"));
+    if (command == "fastdump") return SwiftHintsDumpFast(node, args, target_index, req_path("record"));
     return SwiftHintsDecode(node, target_index, req_path("swifthints"), req_path("record")); // command == "decode"
 },
     };

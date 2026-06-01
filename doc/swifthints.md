@@ -43,7 +43,7 @@ exploits this with **context modeling** and **entropy coding**
 ([entropy coding](https://en.wikipedia.org/wiki/Entropy_coding),
 [context modeling](https://en.wikipedia.org/wiki/Context_model)):
 
-* Each output is assigned to one of **144 contexts** computed from those features.
+* Each output is assigned to one of **105 contexts** computed from those features.
 * For a contiguous range of blocks (a *group*), each context is given a single
   quantized probability of "unspent".
 * The bits are then compressed with **range Asymmetric Numeral Systems (rANS)**
@@ -78,52 +78,52 @@ heights 0, 1, 2, … up to and including the target height. The decoder knows th
 target height out of band and reads groups until those blocks are exhausted; a
 clean end-of-file is expected immediately after the last group.
 
-All multi-byte integers are **little-endian**, with one exception: the per-group
-block count, whose bits are packed across its bytes as described below so that the
-group-mode flag occupies the most significant bit of the group's first byte.
+All multi-byte integers are **little-endian** (uint16 unless noted).
 
-### Group mode
+### Common header and group framing
 
-The **high bit of a group's first byte selects the mode**:
-
-* high bit `0` → **mode 0, full** (a 144-byte per-context probability table)
-* high bit `1` → **mode 1, compact** (a single shared probability byte)
-
-Both modes encode the same underlying bits with the same context model and rANS
-coder; they differ only in how the per-context probabilities are stored, and in the
-width of the block-count field.
-
-### Mode 0 — full group
+Every group begins with the same **4-byte header**, regardless of mode:
 
 | Offset | Size | Field | Description |
 |-------:|-----:|-------|-------------|
-| 0 | 2 | block count | High bit `0`. The remaining **15 bits** hold `blocks − 1`, **big-endian** across the two bytes: byte 0 = `(blocks−1) >> 8` (top bit always 0), byte 1 = `(blocks−1) & 0xFF`. Range: **1 … 32768 blocks**. |
-| 2 | 2 | `N` | Size in bytes of the rANS bitstream that follows the state (uint16, little-endian). |
-| 4 | 144 | probabilities | One quantized probability byte per context, in context-index order 0 … 143. |
-| 148 | 3 | initial state | Initial rANS decoder state, a 3-byte little-endian integer in `[0x10000, 0xFFFFFF]`. |
-| 151 | `N` | bitstream | The rANS-coded bits (see below). |
+| 0 | 2 | size | **Total group size minus these two bytes** — i.e. the number of bytes following the size field (the count field, the probability table, the state, and the bitstream). A reader can skip to the next group at `offset + 2 + size`. |
+| 2 | 2 | count | Low **15 bits** hold `blocks − 1` (range **1 … 32768 blocks**); the **top bit** (bit 15) is the mode flag: `0` → full, `1` → compact. |
 
-Total group size: `4 + 144 + 3 + N` bytes.
+These two fields are all that's needed to walk the file group by group and learn how
+many blocks each group covers, without decoding (or even understanding) the
+probability/rANS payload — so that work can be delegated to lower-level code. The
+size field is a uint16, so a group is at most `0xFFFF + 2` bytes; for a full group
+that caps the state+bitstream at `0xFFFF − 2 − 105` bytes.
 
-### Mode 1 — compact group
+After the header comes the mode-specific payload:
+
+### Mode 0 — full group (count top bit `0`)
 
 | Offset | Size | Field | Description |
 |-------:|-----:|-------|-------------|
-| 0 | 1 | block count | High bit `1`. The low **7 bits** hold `blocks − 1`. Range: **1 … 128 blocks**. |
-| 1 | 2 | `N` | Size in bytes of the rANS bitstream that follows the state (uint16, little-endian). |
-| 3 | 1 | probability | A single quantized probability byte, used for **every** context. |
-| 4 | 3 | initial state | Initial rANS decoder state, a 3-byte little-endian integer in `[0x10000, 0xFFFFFF]`. |
-| 7 | `N` | bitstream | The rANS-coded bits (see below). |
+| 4 | 105 | probabilities | One quantized probability byte per context, in context-index order 0 … 104. |
+| 109 | 3 | initial state | Initial rANS decoder state, a 3-byte little-endian integer in `[0x10000, 0xFFFFFF]`. |
+| 112 | … | bitstream | The rANS-coded bits (see below); its length is `size − 2 − 105 − 3`. |
 
-Total group size: `7 + N` bytes.
+Total group size: `4 + 105 + 3 + N` bytes (size field = `2 + 105 + 3 + N`).
 
-A compact group is exactly equivalent to a full group whose 144 probability bytes
-are all identical; a decoder may simply replicate the single byte into a 144-entry
+### Mode 1 — compact group (count top bit `1`)
+
+| Offset | Size | Field | Description |
+|-------:|-----:|-------|-------------|
+| 4 | 1 | probability | A single quantized probability byte, used for **every** context. |
+| 5 | 3 | initial state | Initial rANS decoder state, a 3-byte little-endian integer in `[0x10000, 0xFFFFFF]`. |
+| 8 | … | bitstream | The rANS-coded bits (see below); its length is `size − 2 − 1 − 3`. |
+
+Total group size: `4 + 1 + 3 + N` bytes (size field = `2 + 1 + 3 + N`).
+
+A compact group is exactly equivalent to a full group whose 105 probability bytes
+are all identical; a decoder may simply replicate the single byte into a 105-entry
 table and then use the mode-0 decode path unchanged.
 
 ## Context model
 
-Every output is mapped to one of 144 contexts (indices `0 … 143`) from three
+Every output is mapped to one of 105 contexts (indices `0 … 104`) from three
 features:
 
 * `n` — the number of outputs in the output's transaction,
@@ -133,23 +133,23 @@ features:
 Let:
 
 ```
-s = min(n, 8) − 1     // size class, 0..7
-p = min(i, 7)         // position class, 0..7
+s = min(n, 7) − 1     // size class, 0..6
+p = min(i, 6)         // position class, 0..6
 ```
 
 The context is then:
 
 ```
-if (p < 7)  context = s*(s+1)*(s+2)/6 + p*(p+1)/2 + spent
-else        context = 112 + min(spent * 32 / i, 31)
+if (p < 6)  context = s*(s+1)*(s+2)/6 + p*(p+1)/2 + spent
+else        context = 77 + min(spent * 28 / i, 27)
 ```
 
 The first branch lays out, for each size class `s`, a triangular block of
 `(p, spent)` pairs (`spent` ranges `0 … p`), offset by the tetrahedral number
-`s*(s+1)*(s+2)/6`. This accounts for contexts `0 … 111` (all positions `i < 7`,
-across size classes). The second branch handles every output at position `i ≥ 7`
-by bucketing the *fraction* of earlier outputs that are spent into 32 buckets,
-giving contexts `112 … 143`. The total is exactly 144.
+`s*(s+1)*(s+2)/6`. This accounts for contexts `0 … 76` (all positions `i < 6`,
+across size classes). The second branch handles every output at position `i ≥ 6`
+by bucketing the *fraction* of earlier outputs that are spent into 28 buckets,
+giving contexts `77 … 104`. The total is exactly 105.
 
 The decoder must compute the context for each output with the identical formula and
 in the identical order the encoder used (see decoding order below), since the
@@ -230,10 +230,10 @@ indicates a corrupt file or a decode desynchronisation.
 
 ## Appendix: how the encoder chooses groups (non-normative)
 
-The format permits *any* partition of the chain into groups (subject to the
-per-mode block-count limits and the 16-bit bitstream-size field), and every valid
-partition decodes to the same bits. The encoder merely tries to pick a partition
-that minimises total file size.
+The format permits *any* partition of the chain into groups (subject to the 32768
+blocks-per-group limit and the 16-bit group-size field), and every valid partition
+decodes to the same bits. The encoder merely tries to pick a partition that minimises
+total file size.
 
 The reference encoder (the standalone `bitcoin-swifthints` tool) works over a sliding
 **lookahead window** of buffered blocks. It buffers blocks until the window is large
