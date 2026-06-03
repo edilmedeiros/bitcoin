@@ -396,6 +396,15 @@ if(BUILD_UTIL)
 endif()
 
 
+add_executable(bitcoin-swifthints bitcoin-swifthints.cpp)
+target_link_libraries(bitcoin-swifthints
+  core_interface
+)
+install(TARGETS bitcoin-swifthints
+  RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+
+
 if(BUILD_GUI)
   add_subdirectory(qt)
 endif()
